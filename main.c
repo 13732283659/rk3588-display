@@ -8,8 +8,6 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/time.h>
-#include <time.h>
 #include <poll.h>
 #include <linux/videodev2.h>
 #include <linux/dma-buf.h>   // 用于内核 Cache 一致性同步锁
@@ -62,47 +60,13 @@ struct DRMContext {
     uint32_t pitch[2];
 };
 
-struct StageStats {
-    double total_ms;
-    double max_ms;
-};
-
-static struct timeval previous_flip_timestamp;
-static int have_previous_flip_timestamp;
-static double flip_interval_total_ms;
-static int flip_interval_samples;
-
-static double elapsed_ms(struct timespec start, struct timespec end) {
-    return (end.tv_sec - start.tv_sec) * 1000.0 +
-           (end.tv_nsec - start.tv_nsec) / 1000000.0;
-}
-
-static void add_stage_sample(struct StageStats *stats, double sample_ms) {
-    stats->total_ms += sample_ms;
-    if (sample_ms > stats->max_ms)
-        stats->max_ms = sample_ms;
-}
-
-static double timeval_delta_ms(struct timeval start, struct timeval end) {
-    return (end.tv_sec - start.tv_sec) * 1000.0 +
-           (end.tv_usec - start.tv_usec) / 1000.0;
-}
-
 static void page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
                               unsigned int tv_usec, void *user_data) {
     int *flip_done = user_data;
-    struct timeval timestamp = { .tv_sec = tv_sec, .tv_usec = tv_usec };
     (void)fd;
     (void)sequence;
-    if (have_previous_flip_timestamp) {
-        double interval_ms = timeval_delta_ms(previous_flip_timestamp, timestamp);
-        if (interval_ms > 0.0) {
-            flip_interval_total_ms += interval_ms;
-            flip_interval_samples++;
-        }
-    }
-    previous_flip_timestamp = timestamp;
-    have_previous_flip_timestamp = 1;
+    (void)tv_sec;
+    (void)tv_usec;
     *flip_done = 1;
 }
 
@@ -396,35 +360,12 @@ int main(int argc, char *argv[]) {
     printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ DRM 双缓冲送显】已平稳启航...\n");
     int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
     int flip_done = 1;
-    const int stats_interval = 100;
-    int stats_frames = 0;
-    int have_previous_capture_timestamp = 0;
-    struct timeval previous_capture_timestamp = {0};
-    struct timespec stats_window_start;
-    struct StageStats flip_wait_stats = {0};
-    struct StageStats dqbuf_stats = {0};
-    struct StageStats rga_stats = {0};
-    struct StageStats flip_submit_stats = {0};
-    struct StageStats qbuf_stats = {0};
-    struct StageStats sleep_stats = {0};
-    struct StageStats frame_stats = {0};
-    double capture_interval_total_ms = 0.0;
-    int capture_interval_samples = 0;
-    clock_gettime(CLOCK_MONOTONIC, &stats_window_start);
 
     for (int i = 0; i < TOTAL_FRAMES; i++) {
-        struct timespec frame_start;
-        struct timespec stage_start;
-        struct timespec stage_end;
-        clock_gettime(CLOCK_MONOTONIC, &frame_start);
-
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
         if (!flip_done && wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0) {
             perror("等待 DRM PageFlip 完成失败");
             break;
         }
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&flip_wait_stats, elapsed_ms(stage_start, stage_end));
 
         struct v4l2_buffer buf;
         struct v4l2_plane planes;
@@ -437,24 +378,9 @@ int main(int argc, char *argv[]) {
         buf.m.planes = &planes;
 
         // [BLOCK-1] DQBUF：等待摄像头硬件把最新图像强行以 DMA 方式写到我们的外部 g_src_pool.fd 上
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
         if (ioctl(g_v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
             perror("DQBUF 错误");
             break;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&dqbuf_stats, elapsed_ms(stage_start, stage_end));
-        if (buf.timestamp.tv_sec != 0 || buf.timestamp.tv_usec != 0) {
-            if (have_previous_capture_timestamp) {
-                double interval_ms = timeval_delta_ms(previous_capture_timestamp,
-                                                      buf.timestamp);
-                if (interval_ms > 0.0) {
-                    capture_interval_total_ms += interval_ms;
-                    capture_interval_samples++;
-                }
-            }
-            previous_capture_timestamp = buf.timestamp;
-            have_previous_capture_timestamp = 1;
         }
         int active_src_fd = g_cam_bufs[buf.index].fd;
 
@@ -469,10 +395,7 @@ int main(int argc, char *argv[]) {
         // 此时由于没有循环内部的 import/release 损耗，RGA 响应速度达到极限
        // [BLOCK-3] 驱动 RGA 硬件执行【4K 相机 FD】到【1080P 显存 FD】的纯物理零拷贝硬件缩放
         // 此时由于没有目的端的重复建立页表开销，硬件效率极大提升
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
         ret = imrotate(rga_src_img, rga_dst_img[drm_idx], IM_HAL_TRANSFORM_ROT_90);
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&rga_stats, elapsed_ms(stage_start, stage_end));
         if (ret != IM_STATUS_SUCCESS) {
             printf("RGA 纯硬件像素缩放失败: %s\n", imStrError((IM_STATUS)ret));
             releasebuffer_handle(rga_src_handle);
@@ -482,7 +405,6 @@ int main(int argc, char *argv[]) {
         // [BLOCK-4] 越微性能调优：向 DRM 申请原子级硬件翻页（PageFlip），对齐屏幕 VSync 垂直时序
         // ⚡ 因为此时完全纯硬件流转，CPU 从未读写这块显存，故在此链条中彻底不需要执行耗时的 Cache 刷新锁！
         flip_done = 0;
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
         if (drmModePageFlip(g_drm.drm_fd, g_drm.crtc_id, g_drm.fb_id[drm_idx],
                             DRM_MODE_PAGE_FLIP_EVENT, &flip_done) < 0) {
             flip_done = 1;
@@ -490,62 +412,13 @@ int main(int argc, char *argv[]) {
             releasebuffer_handle(rga_src_handle);
             break;
         }
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&flip_submit_stats, elapsed_ms(stage_start, stage_end));
 
         // 规范清理当前帧相机的临时映射句柄，阻断引用计数溢出
         releasebuffer_handle(rga_src_handle);
 
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
         if (ioctl(g_v4l2_fd, VIDIOC_QBUF, &buf) < 0) {
             perror("循环 QBUF 失败");
             break;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&qbuf_stats, elapsed_ms(stage_start, stage_end));
-
-        clock_gettime(CLOCK_MONOTONIC, &stage_start);
-        //usleep(16666);
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&sleep_stats, elapsed_ms(stage_start, stage_end));
-
-        clock_gettime(CLOCK_MONOTONIC, &stage_end);
-        add_stage_sample(&frame_stats, elapsed_ms(frame_start, stage_end));
-        stats_frames++;
-        if (stats_frames == stats_interval || i + 1 == TOTAL_FRAMES) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            double window_ms = elapsed_ms(stats_window_start, now);
-            double measured_fps = window_ms > 0.0 ? stats_frames * 1000.0 / window_ms : 0.0;
-            double capture_fps = capture_interval_samples > 0 && capture_interval_total_ms > 0.0
-                               ? capture_interval_samples * 1000.0 / capture_interval_total_ms : 0.0;
-            double display_fps = flip_interval_samples > 0 && flip_interval_total_ms > 0.0
-                               ? flip_interval_samples * 1000.0 / flip_interval_total_ms : 0.0;
-            printf("[性能统计 %d 帧] LoopFPS=%.2f, CameraFPS=%.2f, DRM翻页FPS=%.2f | "
-                   "DQBUF %.2f/%.2f ms | RGA %.2f/%.2f ms | "
-                   "PageFlip等待 %.2f/%.2f ms | 提交 %.2f/%.2f ms | "
-                   "QBUF %.2f/%.2f ms | sleep %.2f/%.2f ms | 帧总耗时 %.2f/%.2f ms\n",
-                   stats_frames, measured_fps, capture_fps, display_fps,
-                   dqbuf_stats.total_ms / stats_frames, dqbuf_stats.max_ms,
-                   rga_stats.total_ms / stats_frames, rga_stats.max_ms,
-                   flip_wait_stats.total_ms / stats_frames, flip_wait_stats.max_ms,
-                   flip_submit_stats.total_ms / stats_frames, flip_submit_stats.max_ms,
-                   qbuf_stats.total_ms / stats_frames, qbuf_stats.max_ms,
-                   sleep_stats.total_ms / stats_frames, sleep_stats.max_ms,
-                   frame_stats.total_ms / stats_frames, frame_stats.max_ms);
-            stats_frames = 0;
-            stats_window_start = now;
-            memset(&flip_wait_stats, 0, sizeof(flip_wait_stats));
-            memset(&dqbuf_stats, 0, sizeof(dqbuf_stats));
-            memset(&rga_stats, 0, sizeof(rga_stats));
-            memset(&flip_submit_stats, 0, sizeof(flip_submit_stats));
-            memset(&qbuf_stats, 0, sizeof(qbuf_stats));
-            memset(&sleep_stats, 0, sizeof(sleep_stats));
-            memset(&frame_stats, 0, sizeof(frame_stats));
-            capture_interval_total_ms = 0.0;
-            capture_interval_samples = 0;
-            flip_interval_total_ms = 0.0;
-            flip_interval_samples = 0;
         }
     }
 
