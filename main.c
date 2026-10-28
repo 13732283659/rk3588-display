@@ -13,6 +13,11 @@
 #include <linux/dma-buf.h>   // 用于内核 Cache 一致性同步锁
 #include <linux/dma-heap.h>  // 用于统一的物理连续内存大管家分配
 
+
+
+
+
+
 // 💡 引入标准 DRM/KMS 头文件
 #include <drm_fourcc.h>
 #include <drm_mode.h>
@@ -26,9 +31,9 @@
 #include "RgaUtils.h"
 
 #define CAMERA_DEV      "/dev/video-camera0"             // 根据板子实际挂载的节点修改
-#define DMA_HEAP_DEV    "/dev/dma_heap/cma" // RK3588 统一连续内存堆节点
+#define DMA_HEAP_DEV    "/dev/dma_heap/system" // RK3588 统一连续内存堆节点
 #define OUTPUT_FILE     "pure_dma_1080p.yuv"
-#define TOTAL_FRAMES    10000                       // 测试抓取 100 帧
+#define TOTAL_FRAMES    100                      // 测试抓取 100 帧
 
 // 输入 4K 规格
 #define SRC_WIDTH       3840
@@ -57,8 +62,17 @@ struct DRMContext {
     uint32_t fb_id[2];
     int gem_handle[2];
     int dma_buf_fd[2];   // 💡 核心调优：供 RGA 写入的显存 FD
+    void *vaddr[2];     //存放映射后的虚拟地址，供 CPU 访问
+    int size;
     uint32_t pitch[2];
 };
+
+
+// 💡 调优规范：封装一个标准的内核 Cache 同步控制函数
+int sync_cpu_cache(int buf_fd, uint64_t sync_flags) {
+    struct dma_buf_sync sync = { .flags = sync_flags };
+    return ioctl(buf_fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
 
 static void page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
                               unsigned int tv_usec, void *user_data) {
@@ -274,6 +288,14 @@ int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
         perror("❌ 错误：显存转化为 DMA-BUF FD 失败");
         return -1;
     }
+    ctx->vaddr[idx] = mmap(NULL, create_req.size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->dma_buf_fd[idx], 0);
+    if (!ctx->vaddr[idx]) {
+        perror("❌ 错误：显存映射失败");
+        return -1;
+    }
+
+    ctx->size = create_req.size;
+    printf("分配的显存大小: %u 字节\n", create_req.size);
 
     // 在显卡内核中将该显存注册绑定为标准的 NV12 格式图层
     uint32_t pitches[4] = { create_req.pitch, 0, 0, 0 };
@@ -310,6 +332,13 @@ int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
 
 int main(int argc, char *argv[]) {
 
+    FILE *fp = NULL;
+    fp = fopen(OUTPUT_FILE, "ab");
+     if (fp == NULL) {
+        perror("fopen failed"); // 打印错误原因（如权限不足、路径不存在）
+        return -1;
+
+    }
     int ret = 0;
     // 1. 点亮 DRM 显示架构并初始化双缓冲显存
     if (init_drm_display(&g_drm) < 0) return -1;
@@ -384,6 +413,22 @@ int main(int argc, char *argv[]) {
         }
         int active_src_fd = g_cam_bufs[buf.index].fd;
 
+        // 🧪 故意制造 Cache 污染：让 CPU 去遍历并大面积改写 dst_img 的内存
+        uint32_t *cpu_ptr = (uint32_t *)g_cam_bufs[buf.index].vaddr;
+        for (int p = 0; p < DST_WIDTH * DST_HEIGHT / 4; p++) {
+            // 故意读取一下，强行把硬件刚写入 DDR 的数据拉进 CPU Cache 中进行“污染”
+            uint32_t temp = cpu_ptr[p]; 
+            if (p % 100 == 0) {
+                cpu_ptr[p] = 0xFFFFFFFF; // 故意每隔 100 个像素点抹成纯白点
+            }
+        }
+        uint8_t *nv12_data = (uint8_t *)g_cam_bufs[buf.index].vaddr;
+        size_t written = fwrite(nv12_data, 1, g_cam_bufs[buf.index].size, fp);
+        if (written != g_cam_bufs[buf.index].size) {
+            printf("警告：只写入了 %zu 字节，预期是 %zu 字节\n", written, g_cam_bufs[buf.index].size);
+        } else {
+            printf("成功写入 %zu 字节到 %s\n", written, OUTPUT_FILE);
+        }
         // 💡 翻转指针：RGA 永远只向目前处于隐藏状态的“后台显存”进行硬件缩放写入
         drm_idx = !drm_idx; 
          // [BLOCK-2] 动态将当前这一帧的 4K 相机输入源导入 RGA 管理器
@@ -391,6 +436,23 @@ int main(int argc, char *argv[]) {
         rga_buffer_t rga_src_img = wrapbuffer_handle(rga_src_handle, SRC_WIDTH, SRC_HEIGHT, RK_FORMAT_YCbCr_420_SP);
         rga_src_img.wstride = src_wstride;
         rga_src_img.hstride = src_hstride;
+         if (i == 0) {
+            IM_STATUS aligned_status = imcheck(rga_src_img, rga_dst_img[drm_idx],
+                                               (im_rect){0}, (im_rect){0});
+             rga_buffer_t misaligned_dst = rga_dst_img[drm_idx];
+             misaligned_dst.wstride += 2;
+            IM_STATUS misaligned_status = imcheck(rga_src_img, misaligned_dst,
+                                                  (im_rect){0}, (im_rect){0});
+
+             printf("RGA stride requirement: %s\n", querystring(RGA_BYTE_STRIDE));
+             printf("Aligned buffers: src wstride=%d hstride=%d, dst wstride=%d hstride=%d, imcheck=%d (%s)\n",
+                 rga_src_img.wstride, rga_src_img.hstride,
+                 rga_dst_img[drm_idx].wstride, rga_dst_img[drm_idx].hstride,
+                 aligned_status, imStrError(aligned_status));
+             printf("Misaligned test only: dst wstride=%d, imcheck=%d (%s)\n",
+                 misaligned_dst.wstride, misaligned_status,
+                 imStrError(misaligned_status));
+         }
         // [BLOCK-2] 硬件极速越过：驱动 RGA 硬件执行【外部源 fd】到【外部目的 fd】的硬件缩放转换
         // 此时由于没有循环内部的 import/release 损耗，RGA 响应速度达到极限
        // [BLOCK-3] 驱动 RGA 硬件执行【4K 相机 FD】到【1080P 显存 FD】的纯物理零拷贝硬件缩放
@@ -401,6 +463,20 @@ int main(int argc, char *argv[]) {
             releasebuffer_handle(rga_src_handle);
             break;
         }
+       
+
+        /*sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        // 写入文件,测试cache文件的问题
+        size_t frame_size = DST_WIDTH * DST_HEIGHT * 3 / 2; // NV12
+        uint8_t *nv12_data = (uint8_t *)g_drm.vaddr[drm_idx];
+        size_t written = fwrite(nv12_data, 1, g_drm.size, fp);
+        if (written != g_drm.size) {
+            printf("警告：只写入了 %zu 字节，预期是 %zu 字节\n", written, g_drm.size);
+        } else {
+            printf("成功写入 %zu 字节到 %s\n", written, OUTPUT_FILE);
+        }
+        */
+       //sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
 
         // [BLOCK-4] 越微性能调优：向 DRM 申请原子级硬件翻页（PageFlip），对齐屏幕 VSync 垂直时序
         // ⚡ 因为此时完全纯硬件流转，CPU 从未读写这块显存，故在此链条中彻底不需要执行耗时的 Cache 刷新锁！
@@ -425,7 +501,7 @@ int main(int argc, char *argv[]) {
     printf("流转结束，开始优雅销毁并归还系统显示主权...\n");
     if (!flip_done && wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0)
         perror("退出前等待 DRM PageFlip 完成失败");
-    // 关闭视频流
+    //关闭视频流
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     ioctl(g_v4l2_fd, VIDIOC_STREAMOFF, &type);
     // 释放 RGA 目的端常驻句柄
@@ -441,6 +517,9 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < CAM_BUF_COUNT; i++) close(g_cam_bufs[i].fd);
     close(g_v4l2_fd);
     drmClose(g_drm.drm_fd);
+     if (fclose(fp) != 0) {
+        perror("fclose failed");
+    }
     printf("全链路资源清理完毕，程序安全退出。\n");
     return 0;
 }
