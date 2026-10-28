@@ -31,7 +31,7 @@
 #include "RgaUtils.h"
 
 #define CAMERA_DEV      "/dev/video-camera0"             // 根据板子实际挂载的节点修改
-#define DMA_HEAP_DEV    "/dev/dma_heap/system" // RK3588 统一连续内存堆节点
+#define DMA_HEAP_DEV    "/dev/dma_heap/cma" // RK3588 统一连续内存堆节点
 #define OUTPUT_FILE     "pure_dma_1080p.yuv"
 #define TOTAL_FRAMES    100                      // 测试抓取 100 帧
 
@@ -413,22 +413,6 @@ int main(int argc, char *argv[]) {
         }
         int active_src_fd = g_cam_bufs[buf.index].fd;
 
-        // 🧪 故意制造 Cache 污染：让 CPU 去遍历并大面积改写 dst_img 的内存
-        uint32_t *cpu_ptr = (uint32_t *)g_cam_bufs[buf.index].vaddr;
-        for (int p = 0; p < DST_WIDTH * DST_HEIGHT / 4; p++) {
-            // 故意读取一下，强行把硬件刚写入 DDR 的数据拉进 CPU Cache 中进行“污染”
-            uint32_t temp = cpu_ptr[p]; 
-            if (p % 100 == 0) {
-                cpu_ptr[p] = 0xFFFFFFFF; // 故意每隔 100 个像素点抹成纯白点
-            }
-        }
-        uint8_t *nv12_data = (uint8_t *)g_cam_bufs[buf.index].vaddr;
-        size_t written = fwrite(nv12_data, 1, g_cam_bufs[buf.index].size, fp);
-        if (written != g_cam_bufs[buf.index].size) {
-            printf("警告：只写入了 %zu 字节，预期是 %zu 字节\n", written, g_cam_bufs[buf.index].size);
-        } else {
-            printf("成功写入 %zu 字节到 %s\n", written, OUTPUT_FILE);
-        }
         // 💡 翻转指针：RGA 永远只向目前处于隐藏状态的“后台显存”进行硬件缩放写入
         drm_idx = !drm_idx; 
          // [BLOCK-2] 动态将当前这一帧的 4K 相机输入源导入 RGA 管理器
@@ -463,21 +447,62 @@ int main(int argc, char *argv[]) {
             releasebuffer_handle(rga_src_handle);
             break;
         }
-       
-
-        /*sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-        // 写入文件,测试cache文件的问题
-        size_t frame_size = DST_WIDTH * DST_HEIGHT * 3 / 2; // NV12
-        uint8_t *nv12_data = (uint8_t *)g_drm.vaddr[drm_idx];
-        size_t written = fwrite(nv12_data, 1, g_drm.size, fp);
-        if (written != g_drm.size) {
-            printf("警告：只写入了 %zu 字节，预期是 %zu 字节\n", written, g_drm.size);
-        } else {
-            printf("成功写入 %zu 字节到 %s\n", written, OUTPUT_FILE);
+         
+        // ================= 🧪 注入：纯正的 DRM 目的端显存 Cache 脏数据破坏实验 =================
+        // 💡 核心对齐：故意删掉或注释掉任何 sync_cpu_cache 锁！
+        
+         // 1. 获取当前正在处理的 DRM 显示缓冲区的虚拟地址与硬件真实跨度
+        uint8_t *drm_vaddr = (uint8_t *)g_drm.vaddr[drm_idx];
+        uint32_t real_stride = g_drm.pitch[drm_idx]; // ⚡ 必须用显卡回填的真实步长
+        
+        // 定位到符合显卡内核拓扑的 UV 平面起始地址 (Y 占满了 real_stride * DST_HEIGHT)
+        uint8_t *uv_plane = drm_vaddr + (real_stride * DST_HEIGHT);
+        
+        // 2. ⚡ 强行高频污染 CPU Cache 缓存行 (保持不变，空读硬件刚写入的 DDR)
+        volatile uint8_t dummy_read = 0;
+        size_t frame_bytes = g_drm.size;
+        for (size_t p = 0; p < frame_bytes; p += 64) {
+            dummy_read = drm_vaddr[p]; 
         }
-        */
-       //sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
 
+
+
+        // 3. ⚡ 精准二阶阵列涂写：在画面正中央区域，硬生生涂写 5 个【绝对处于有效显示区内】的纯红点
+        // 我们不采用一维指针递增，直接用 Y 行和 X 列，强行写入硬件可见区域
+        int red_dot_count = 0;
+        int target_y = DST_HEIGHT / 2; // 选在竖屏的正中间行 (约 960 行处)
+        int start_x  = DST_WIDTH / 4;   // 从屏幕水平 1/4 处开始排布
+
+        for (int x_offset = 0; x_offset < 500; x_offset += 100) {
+            if (red_dot_count < 5) {
+                int cur_x = start_x + x_offset;
+                int cur_y = target_y;
+
+                // 💡 核心调优对齐：严格按照 real_stride 进行换行寻址映射！
+                // 写入 Y 平面 (亮度层)
+                drm_vaddr[cur_y * real_stride + cur_x] = 0x4C; // Y = 76
+
+                // 写入 UV 平面 (色彩层，NV12 格式下 U 和 V 交错排列，且宽高减半)
+                int uv_x_aligned = (cur_x / 2) * 2;
+                int uv_y_aligned = cur_y / 2;
+                size_t uv_offset = (uv_y_aligned * real_stride) + uv_x_aligned;
+
+                uv_plane[uv_offset]     = 0x54; // U = 84
+                uv_plane[uv_offset + 1] = 0xFF; // V = 255
+
+                red_dot_count++;
+            }
+        }
+        
+        // 4. ⚡ 强行在缓存极度错乱的状态下，用 CPU 抓取这个目的端显存指针直接 fwrite 导出落盘
+        sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        if (fp) {
+            // 💡 调优注意：原代码中第 352 行写入的是相机数据，请把它删掉，改成在这里写入经过 RGA 处理且被污染的 drm_vaddr
+            size_t written = fwrite(drm_vaddr, 1, frame_bytes, fp);
+            printf("🧪 [Cache破坏成功] 成功在肮脏缓存状态下将 RGA 目的端强行落盘 %zu 字节。\n", written);
+        }
+        sync_cpu_cache(g_drm.dma_buf_fd[drm_idx], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        // ======================================================================
         // [BLOCK-4] 越微性能调优：向 DRM 申请原子级硬件翻页（PageFlip），对齐屏幕 VSync 垂直时序
         // ⚡ 因为此时完全纯硬件流转，CPU 从未读写这块显存，故在此链条中彻底不需要执行耗时的 Cache 刷新锁！
         flip_done = 0;
