@@ -51,7 +51,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) --sysroot=$(ROOT_SYSROOT) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) pure_dma_1080p.yuv
 
 .PHONY: all clean
 
