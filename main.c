@@ -26,11 +26,12 @@
 // 引入瑞芯微 RGA 核心头文件
 #include "RgaUtils.h"
 #include "im2d.h"
+#include "rknn_infer.h"
 
 #define CAMERA_DEV "/dev/video-camera0"  // 根据实际情况修改
 #define DMA_HEAP_DEV "/dev/dma_heap/cma"
 #define OUTPUT_FILE "pure_dma_1080p.yuv"
-#define TOTAL_FRAMES 1000 // 测试抓取 100 帧
+#define TOTAL_FRAMES 10000 // 测试抓取 100 帧
 
 // 输入 4K 规格
 #define SRC_WIDTH 3840
@@ -39,6 +40,7 @@
 // DSI 面板为竖屏 1080x1920
 #define DST_WIDTH 1080
 #define DST_HEIGHT 1920
+#define DEFAULT_RKNN_MODEL "./model/RK3588/yolov5s-640-640.rknn"
 
 // V4L2 采集端缓冲区数量
 #define CAM_BUF_COUNT 2
@@ -305,12 +307,159 @@ int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
   return 0;
 }
 
+static void draw_nv12_pixel(uint8_t *frame, int pitch, int height, int x,
+                            int y) {
+  if (x < 0 || x >= DST_WIDTH || y < 0 || y >= height)
+    return;
+  frame[y * pitch + x] = 149;
+  uint8_t *uv = frame + (size_t)pitch * height;
+  int uv_index = (y / 2) * pitch + (x & ~1);
+  uv[uv_index] = 43;
+  uv[uv_index + 1] = 21;
+}
+
+static uint8_t score_glyph_row(char character, int row) {
+  static const uint8_t letters[26][7] = {
+      {14, 17, 17, 31, 17, 17, 17}, {30, 17, 17, 30, 17, 17, 30},
+      {14, 17, 16, 16, 16, 17, 14}, {30, 17, 17, 17, 17, 17, 30},
+      {31, 16, 16, 30, 16, 16, 31}, {31, 16, 16, 30, 16, 16, 16},
+      {14, 17, 16, 23, 17, 17, 15}, {17, 17, 17, 31, 17, 17, 17},
+      {14, 4, 4, 4, 4, 4, 14},       {7, 2, 2, 2, 18, 18, 12},
+      {17, 18, 20, 24, 20, 18, 17}, {16, 16, 16, 16, 16, 16, 31},
+      {17, 27, 21, 21, 17, 17, 17}, {17, 25, 21, 19, 17, 17, 17},
+      {14, 17, 17, 17, 17, 17, 14}, {30, 17, 17, 30, 16, 16, 16},
+      {14, 17, 17, 17, 21, 18, 13}, {30, 17, 17, 30, 20, 18, 17},
+      {15, 16, 16, 14, 1, 1, 30},    {31, 4, 4, 4, 4, 4, 4},
+      {17, 17, 17, 17, 17, 17, 14}, {17, 17, 17, 17, 17, 10, 4},
+      {17, 17, 17, 21, 21, 21, 10}, {17, 17, 10, 4, 10, 17, 17},
+      {17, 17, 10, 4, 4, 4, 4},     {31, 1, 2, 4, 8, 16, 31}};
+  static const uint8_t digits[10][7] = {
+      {14, 17, 19, 21, 25, 17, 14}, {4, 12, 4, 4, 4, 4, 14},
+      {14, 17, 1, 2, 4, 8, 31},    {30, 1, 1, 14, 1, 1, 30},
+      {2, 6, 10, 18, 31, 2, 2},    {31, 16, 16, 30, 1, 1, 30},
+      {14, 16, 16, 30, 17, 17, 14}, {31, 1, 2, 4, 8, 8, 8},
+      {14, 17, 17, 14, 17, 17, 14}, {14, 17, 17, 15, 1, 1, 14}};
+  static const uint8_t percent[7] = {17, 2, 4, 8, 16, 17, 0};
+  if (row < 0 || row >= 7)
+    return 0;
+  if (character >= 'a' && character <= 'z')
+    character -= 'a' - 'A';
+  if (character >= 'A' && character <= 'Z')
+    return letters[character - 'A'][row];
+  if (character >= '0' && character <= '9')
+    return digits[character - '0'][row];
+  if (character == '%')
+    return percent[row];
+  return 0;
+}
+
+static void draw_score_label(uint8_t *frame, int pitch, int left, int top,
+                             const char *name, float score) {
+  char text[32];
+  int percent = (int)(score * 100.0f + 0.5f);
+  if (percent < 0)
+    percent = 0;
+  if (percent > 100)
+    percent = 100;
+  snprintf(text, sizeof(text), "%s %d%%", name, percent);
+
+  const int scale = 3;
+  const int glyph_width = 5 * scale;
+  const int glyph_height = 7 * scale;
+  const int spacing = scale;
+  int text_width = (int)strlen(text) * (glyph_width + spacing) - spacing;
+  int label_x = left;
+  if (label_x + text_width > DST_WIDTH)
+    label_x = DST_WIDTH - text_width;
+  int label_y = top - glyph_height - 2 * scale;
+  if (label_y < 0)
+    label_y = top;
+  if (label_y + glyph_height > DST_HEIGHT)
+    label_y = DST_HEIGHT - glyph_height;
+
+  uint8_t *uv = frame + (size_t)pitch * DST_HEIGHT;
+  for (int y = label_y - scale; y < label_y + glyph_height + scale; ++y) {
+    if (y < 0 || y >= DST_HEIGHT)
+      continue;
+    memset(frame + (size_t)y * pitch + label_x, 16,
+           (size_t)text_width);
+    int uv_y = y / 2;
+    for (int x = label_x & ~1; x < label_x + text_width; x += 2) {
+      if (x + 1 < pitch) {
+        uv[uv_y * pitch + x] = 128;
+        uv[uv_y * pitch + x + 1] = 128;
+      }
+    }
+  }
+
+  for (int character_index = 0; text[character_index] != '\0';
+       ++character_index) {
+    int character_x = label_x + character_index * (glyph_width + spacing);
+    for (int row = 0; row < 7; ++row) {
+      uint8_t bits = score_glyph_row(text[character_index], row);
+      for (int column = 0; column < 5; ++column) {
+        if (!(bits & (1u << (4 - column))))
+          continue;
+        for (int dy = 0; dy < scale; ++dy) {
+          int y = label_y + row * scale + dy;
+          for (int dx = 0; dx < scale; ++dx) {
+            int x = character_x + column * scale + dx;
+            if (x < 0 || x >= DST_WIDTH || y < 0 || y >= DST_HEIGHT)
+              continue;
+            frame[(size_t)y * pitch + x] = 235;
+          }
+        }
+      }
+    }
+  }
+}
+
+static void draw_detection_boxes(uint8_t *frame, int pitch,
+                                 const RknnDetection *detections, int count) {
+  for (int i = 0; i < count; ++i) {
+    int left = detections[i].left;
+    int right = detections[i].right;
+    int top = detections[i].top;
+    int bottom = detections[i].bottom;
+    if (right <= left || bottom <= top)
+      continue;
+    for (int thickness = 0; thickness < 3; ++thickness) {
+      int y_top = top + thickness;
+      int y_bottom = bottom - thickness;
+      int x_left = left + thickness;
+      int x_right = right - thickness;
+      for (int x = left; x <= right; ++x) {
+        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x, y_top);
+        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x, y_bottom);
+      }
+      for (int y = top; y <= bottom; ++y) {
+        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x_left, y);
+        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x_right, y);
+      }
+    }
+    draw_score_label(frame, pitch, left, top, detections[i].name,
+             detections[i].score);
+  }
+}
+
 int main(int argc, char *argv[]) {
+  const char *model_path = argc > 1 ? argv[1] : DEFAULT_RKNN_MODEL;
+  RknnDetector detector = {0};
+  if (rknn_detector_init(&detector, model_path) < 0) {
+    fprintf(stderr, "RKNN model initialization failed: %s\n", model_path);
+    return -1;
+  }
+  printf("RKNN detector ready: %s, input=%dx%d\n", model_path,
+         detector.model_width, detector.model_height);
+
+  #if 0    // 调试实验开关：0=关闭，1=开启    
   FILE *fp = fopen(OUTPUT_FILE, "ab");
   if (fp == NULL) {
     perror("fopen failed");
+    rknn_detector_deinit(&detector);
     return -1;
   }
+  #endif    
 
   // 1. 点亮 DRM 显示架构并初始化双缓冲显存
   if (init_drm_display(&g_drm) < 0)
@@ -365,6 +514,8 @@ int main(int argc, char *argv[]) {
   // 个显存中央提前抹红 彻底解耦多硬件异步时间差，完美对齐 Stride
   // 寻址，解决前几十帧红点丢失的隐患
   // =========================================================================
+
+  #if 0 // 调试实验开关：0=关闭，1=开启
   for (int idx = 0; idx < 2; idx++) {
     uint8_t *static_vaddr = (uint8_t *)g_drm.vaddr[idx];
     uint32_t static_stride = g_drm.pitch[idx];
@@ -389,6 +540,8 @@ int main(int argc, char *argv[]) {
     sync_cpu_cache(g_drm.dma_buf_fd[idx],
                    DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
   }
+  #endif
+
   printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ DRM 双缓冲送显】已平稳启航...\n");
   int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
   int flip_done = 1;
@@ -412,7 +565,8 @@ int main(int argc, char *argv[]) {
     int active_src_fd = g_cam_bufs[buf.index].fd;
                  // ================= 🧪 注入：【4K 相机源端·逆向几何对齐】Cache 脏数据与屏幕红点实验场 =================
         // 💡 调优核心 1：在 CPU 动笔改写 4K 连续堆内存前，必须拉起内核【写开始锁】，确保硬件感知
-
+       
+        #if 0 //调优实验开关：0=关闭，1=开启
         //这个是刷新缓存的操作，确保CPU对内存的修改能够被其他硬件看到
         sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
 
@@ -461,9 +615,11 @@ int main(int argc, char *argv[]) {
         // --------------------------------------------------------------------------------
         // 💡 读锁包裹：把这帧被 CPU 抹了红点的 4K 原始数据直接落盘抓包
         //sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+      
         if (fp) {
             size_t written = fwrite(cam_vaddr, 1, cam_bytes, fp);
         }
+        #endif
         //sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
         // ==============================================================
         // ==============================================================
@@ -493,6 +649,34 @@ int main(int argc, char *argv[]) {
       releasebuffer_handle(rga_src_handle);
       break;
     }
+
+    RknnDetection detections[64];
+    int detection_count = 0;
+    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ) == 0) {
+      detection_count = rknn_detector_run(
+          &detector, (const uint8_t *)g_drm.vaddr[drm_idx], DST_WIDTH,
+          DST_HEIGHT, g_drm.pitch[drm_idx], detections, 64);
+      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+      if (detection_count < 0) {
+        fprintf(stderr, "RKNN inference failed on frame %d\n", i);
+        detection_count = 0;
+      }
+    } else {
+      perror("DRM DMA-BUF CPU read sync failed");
+    }
+
+    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
+      draw_detection_boxes((uint8_t *)g_drm.vaddr[drm_idx],
+                           g_drm.pitch[drm_idx], detections, detection_count);
+      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    } else {
+      perror("DRM DMA-BUF CPU write sync failed");
+    }
+
     // 原子级翻页送显
     flip_done = 0;
     if (drmModePageFlip(g_drm.drm_fd, g_drm.crtc_id, g_drm.fb_id[drm_idx],
@@ -526,7 +710,8 @@ int main(int argc, char *argv[]) {
     close(g_cam_bufs[i].fd);
   close(g_v4l2_fd);
   drmClose(g_drm.drm_fd);
-  fclose(fp);
+  // fclose(fp);
+  rknn_detector_deinit(&detector);
   printf("全链路资源清理完毕，程序安全退出。\n");
   return 0;
 }
