@@ -652,19 +652,12 @@ int main(int argc, char *argv[]) {
 
     RknnDetection detections[64];
     int detection_count = 0;
-    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ) == 0) {
-      detection_count = rknn_detector_run(
-          &detector, (const uint8_t *)g_drm.vaddr[drm_idx], DST_WIDTH,
-          DST_HEIGHT, g_drm.pitch[drm_idx], detections, 64);
-      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-      if (detection_count < 0) {
-        fprintf(stderr, "RKNN inference failed on frame %d\n", i);
-        detection_count = 0;
-      }
-    } else {
-      perror("DRM DMA-BUF CPU read sync failed");
+    detection_count = rknn_detector_run(
+        &detector, g_drm.dma_buf_fd[drm_idx], DST_WIDTH, DST_HEIGHT,
+        g_drm.pitch[drm_idx], detections, 64);
+    if (detection_count < 0) {
+      fprintf(stderr, "RKNN inference failed on frame %d\n", i);
+      detection_count = 0;
     }
 
     if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],

@@ -26,7 +26,7 @@ typedef struct {
 } RknnDetector;
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path);
-int rknn_detector_run(RknnDetector *detector, const uint8_t *nv12,
+int rknn_detector_run(RknnDetector *detector, int nv12_fd,
                       int width, int height, int pitch,
                       RknnDetection *detections, int max_detections);
 void rknn_detector_deinit(RknnDetector *detector);

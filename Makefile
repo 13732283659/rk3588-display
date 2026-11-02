@@ -22,7 +22,7 @@ OBJS          := main.o rknn_infer.o rknn_postprocess.o
 
 # ================= 编译参数 =================
 # C 标准及优化等级
-CFLAGS        := -std=c11 -O0 -Wall -Wextra -g
+CFLAGS        := -std=c11 -O2 -Wall -Wextra -g
 CXXFLAGS      := -std=c++11 -O2 -Wall -Wextra -g
 
 # 头文件路径 (-I)
@@ -50,7 +50,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	@echo "Linking $@"
-	        $(CXX) $(OBJS) -o $@ $(LDFLAGS)
+	        $(CXX) -g $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Build success: $(TARGET)"
 
 %.o: %.c

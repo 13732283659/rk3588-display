@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include "RgaUtils.h"
+#include "im2d.h"
 #include "postprocess.h"
 #include "rknn_api.h"
 
@@ -15,24 +17,9 @@ struct DetectorState {
   rknn_tensor_attr input_attr;
   rknn_tensor_attr output_attrs[3];
   std::vector<uint8_t> input_rgb;
+  std::vector<uint8_t> resized_rgb;
+  int resized_rgb_stride;
 };
-
-static uint8_t clamp_byte(int value) {
-  return static_cast<uint8_t>(std::max(0, std::min(255, value)));
-}
-
-static void nv12_to_rgb(const uint8_t *nv12, int height, int pitch,
-                        int x, int y, uint8_t *rgb) {
-  int y_value = nv12[y * pitch + x];
-  const uint8_t *uv = nv12 + static_cast<size_t>(pitch) * height;
-  int uv_index = (y / 2) * pitch + (x & ~1);
-  int u_value = uv[uv_index] - 128;
-  int v_value = uv[uv_index + 1] - 128;
-  int c = std::max(0, y_value - 16);
-  rgb[0] = clamp_byte((298 * c + 409 * v_value + 128) >> 8);
-  rgb[1] = clamp_byte((298 * c - 100 * u_value - 208 * v_value + 128) >> 8);
-  rgb[2] = clamp_byte((298 * c + 516 * u_value + 128) >> 8);
-}
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   if (!detector || !model_path)
@@ -126,6 +113,9 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   }
   state->input_rgb.resize(static_cast<size_t>(detector->model_width) *
                            detector->model_height * 3);
+  state->resized_rgb_stride = (detector->model_width + 15) & ~15;
+  state->resized_rgb.resize(static_cast<size_t>(state->resized_rgb_stride) *
+                            detector->model_height * 3);
   detector->context = state;
   detector->model_data = model_data;
   detector->output_count = state->io_count.n_output;
@@ -133,10 +123,10 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   return 0;
 }
 
-int rknn_detector_run(RknnDetector *detector, const uint8_t *nv12, int width,
+int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                       int height, int pitch, RknnDetection *detections,
                       int max_detections) {
-  if (!detector || !detector->context || !nv12 || !detections ||
+  if (!detector || !detector->context || nv12_fd < 0 || !detections ||
       max_detections <= 0 || width <= 0 || height <= 0 || pitch < width)
     return -1;
   DetectorState *state = static_cast<DetectorState *>(detector->context);
@@ -149,16 +139,26 @@ int rknn_detector_run(RknnDetector *detector, const uint8_t *nv12, int width,
   int pad_left = (model_width - resized_width) / 2;
   int pad_top = (model_height - resized_height) / 2;
   std::fill(state->input_rgb.begin(), state->input_rgb.end(), 114);
+  rga_buffer_t src = wrapbuffer_fd(nv12_fd, width, height,
+                                   RK_FORMAT_YCbCr_420_SP, pitch, height);
+  rga_buffer_t dst = wrapbuffer_virtualaddr(
+      state->resized_rgb.data(), resized_width, resized_height,
+      RK_FORMAT_RGB_888, state->resized_rgb_stride, resized_height);
+  IM_STATUS rga_status = imresize(src, dst);
+  if (rga_status != IM_STATUS_SUCCESS) {
+    std::fprintf(stderr, "RGA NV12-to-RGB resize failed: %s\n",
+                 imStrError(rga_status));
+    return -1;
+  }
 
+  const size_t row_bytes = static_cast<size_t>(resized_width) * 3;
   for (int y = 0; y < resized_height; ++y) {
-    int source_y = std::min(height - 1, y * height / resized_height);
-    for (int x = 0; x < resized_width; ++x) {
-      int source_x = std::min(width - 1, x * width / resized_width);
-      size_t dst_index =
-          (static_cast<size_t>(y + pad_top) * model_width + x + pad_left) * 3;
-      nv12_to_rgb(nv12, height, pitch, source_x, source_y,
-                  &state->input_rgb[dst_index]);
-    }
+    size_t dst_offset =
+        (static_cast<size_t>(y + pad_top) * model_width + pad_left) * 3;
+    size_t src_offset =
+      static_cast<size_t>(y) * state->resized_rgb_stride * 3;
+    std::memcpy(state->input_rgb.data() + dst_offset,
+                state->resized_rgb.data() + src_offset, row_bytes);
   }
 
   rknn_input input{};
