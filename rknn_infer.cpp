@@ -4,7 +4,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
+#include <fcntl.h>
+#include <limits>
+#include <linux/dma-heap.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "RgaUtils.h"
 #include "im2d.h"
@@ -16,9 +21,10 @@ struct DetectorState {
   rknn_input_output_num io_count;
   rknn_tensor_attr input_attr;
   rknn_tensor_attr output_attrs[3];
-  std::vector<uint8_t> input_rgb;
-  std::vector<uint8_t> resized_rgb;
-  int resized_rgb_stride;
+  rknn_tensor_mem *input_mem;
+  int input_fd;
+  void *input_mapping;
+  size_t input_mapping_size;
 };
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path) {
@@ -55,6 +61,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
     std::free(model_data);
     return -1;
   }
+  state->input_fd = -1;
+  state->input_mapping = MAP_FAILED;
   state->context = 0;
   int ret = rknn_init(&state->context, model_data, model_size, 0, nullptr);
   if (ret < 0) {
@@ -111,11 +119,82 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
       return -1;
     }
   }
-  state->input_rgb.resize(static_cast<size_t>(detector->model_width) *
-                           detector->model_height * 3);
-  state->resized_rgb_stride = (detector->model_width + 15) & ~15;
-  state->resized_rgb.resize(static_cast<size_t>(state->resized_rgb_stride) *
-                            detector->model_height * 3);
+
+    state->input_attr.type = RKNN_TENSOR_UINT8;
+    if (state->input_attr.fmt != RKNN_TENSOR_NHWC ||
+      state->input_attr.w_stride <
+        static_cast<uint32_t>(detector->model_width) ||
+      state->input_attr.w_stride >
+        static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    std::fprintf(stderr,
+                 "RKNN zero-copy input requires NHWC UINT8 and valid width stride\n");
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
+  uint64_t required_size =
+      static_cast<uint64_t>(state->input_attr.w_stride) *
+      detector->model_height * 3;
+  if (required_size > std::numeric_limits<uint32_t>::max() ||
+      state->input_attr.size_with_stride < required_size) {
+    std::fprintf(stderr, "RKNN input tensor stride/size is incompatible with RGA\n");
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
+
+  int heap_fd = open("/dev/dma_heap/cma", O_RDWR | O_CLOEXEC);
+  if (heap_fd < 0) {
+    std::perror("open CMA DMA heap for RKNN input");
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
+  struct dma_heap_allocation_data allocation = {};
+  allocation.len = state->input_attr.size_with_stride;
+  allocation.fd_flags = O_RDWR | O_CLOEXEC;
+  if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation) < 0) {
+    std::perror("allocate RKNN input DMA-BUF");
+    close(heap_fd);
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
+  close(heap_fd);
+  state->input_fd = static_cast<int>(allocation.fd);
+  state->input_mapping_size = state->input_attr.size_with_stride;
+  state->input_mapping = mmap(nullptr, state->input_mapping_size,
+                              PROT_READ | PROT_WRITE, MAP_SHARED,
+                              state->input_fd, 0);
+  if (state->input_mapping == MAP_FAILED) {
+    std::perror("mmap RKNN input DMA-BUF");
+    close(state->input_fd);
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
+
+  state->input_mem = rknn_create_mem_from_fd(
+      state->context, state->input_fd, state->input_mapping,
+      state->input_attr.size_with_stride, 0);
+  if (!state->input_mem ||
+      rknn_set_io_mem(state->context, state->input_mem,
+                      &state->input_attr) < 0) {
+    std::fprintf(stderr, "bind RKNN input DMA-BUF failed\n");
+    if (state->input_mem)
+      rknn_destroy_mem(state->context, state->input_mem);
+    munmap(state->input_mapping, state->input_mapping_size);
+    close(state->input_fd);
+    rknn_destroy(state->context);
+    delete state;
+    std::free(model_data);
+    return -1;
+  }
   detector->context = state;
   detector->model_data = model_data;
   detector->output_count = state->io_count.n_output;
@@ -138,37 +217,27 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   int resized_height = static_cast<int>(height * scale + 0.5f);
   int pad_left = (model_width - resized_width) / 2;
   int pad_top = (model_height - resized_height) / 2;
-  std::fill(state->input_rgb.begin(), state->input_rgb.end(), 114);
   rga_buffer_t src = wrapbuffer_fd(nv12_fd, width, height,
                                    RK_FORMAT_YCbCr_420_SP, pitch, height);
-  rga_buffer_t dst = wrapbuffer_virtualaddr(
-      state->resized_rgb.data(), resized_width, resized_height,
-      RK_FORMAT_RGB_888, state->resized_rgb_stride, resized_height);
-  IM_STATUS rga_status = imresize(src, dst);
+  rga_buffer_t dst = wrapbuffer_fd(
+      state->input_fd, model_width, model_height, RK_FORMAT_RGB_888,
+      static_cast<int>(state->input_attr.w_stride), model_height);
+  im_rect full_rect = {0, 0, model_width, model_height};
+  IM_STATUS rga_status = imfill(dst, full_rect, 0xff727272);
   if (rga_status != IM_STATUS_SUCCESS) {
-    std::fprintf(stderr, "RGA NV12-to-RGB resize failed: %s\n",
+    std::fprintf(stderr, "RGA letterbox fill failed: %s\n",
                  imStrError(rga_status));
     return -1;
   }
-
-  const size_t row_bytes = static_cast<size_t>(resized_width) * 3;
-  for (int y = 0; y < resized_height; ++y) {
-    size_t dst_offset =
-        (static_cast<size_t>(y + pad_top) * model_width + pad_left) * 3;
-    size_t src_offset =
-      static_cast<size_t>(y) * state->resized_rgb_stride * 3;
-    std::memcpy(state->input_rgb.data() + dst_offset,
-                state->resized_rgb.data() + src_offset, row_bytes);
+  im_rect src_rect = {0, 0, width, height};
+  im_rect dst_rect = {pad_left, pad_top, resized_width, resized_height};
+  rga_status = improcess(src, dst, {}, src_rect, dst_rect, {}, IM_SYNC);
+  if (rga_status != IM_STATUS_SUCCESS) {
+    std::fprintf(stderr, "RGA NV12-to-RGB letterbox resize failed: %s\n",
+                 imStrError(rga_status));
+    return -1;
   }
-
-  rknn_input input{};
-  input.index = 0;
-  input.type = RKNN_TENSOR_UINT8;
-  input.size = state->input_rgb.size();
-  input.fmt = RKNN_TENSOR_NHWC;
-  input.buf = state->input_rgb.data();
-  if (rknn_inputs_set(state->context, 1, &input) < 0 ||
-      rknn_run(state->context, nullptr) < 0)
+  if (rknn_run(state->context, nullptr) < 0)
     return -1;
 
   rknn_output outputs[3]{};
@@ -216,6 +285,12 @@ void rknn_detector_deinit(RknnDetector *detector) {
     return;
   DetectorState *state = static_cast<DetectorState *>(detector->context);
   if (state) {
+    if (state->input_mem)
+      rknn_destroy_mem(state->context, state->input_mem);
+    if (state->input_mapping != MAP_FAILED)
+      munmap(state->input_mapping, state->input_mapping_size);
+    if (state->input_fd >= 0)
+      close(state->input_fd);
     rknn_destroy(state->context);
     delete state;
   }

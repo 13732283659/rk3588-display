@@ -542,7 +542,7 @@ int main(int argc, char *argv[]) {
   }
   #endif
 
-  printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ DRM 双缓冲送显】已平稳启航...\n");
+  printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ NPU -> DRM 双缓冲送显】已平稳启航...\n");
   int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
   int flip_done = 1;
   for (int i = 0; i < TOTAL_FRAMES; i++) {
