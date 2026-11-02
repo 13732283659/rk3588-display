@@ -22,6 +22,7 @@ struct DetectorState {
   rknn_tensor_attr input_attr;
   rknn_tensor_attr output_attrs[3];
   rknn_tensor_mem *input_mem;
+  rknn_tensor_mem *output_mems[3];
   int input_fd;
   void *input_mapping;
   size_t input_mapping_size;
@@ -120,6 +121,24 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
     }
   }
 
+  for (uint32_t i = 0; i < state->io_count.n_output; ++i) {
+    state->output_mems[i] =
+        rknn_create_mem(state->context, state->output_attrs[i].size);
+    if (!state->output_mems[i] ||
+        rknn_set_io_mem(state->context, state->output_mems[i],
+                        &state->output_attrs[i]) < 0) {
+      std::fprintf(stderr, "bind RKNN output tensor %u failed\n", i);
+      for (uint32_t j = 0; j <= i; ++j) {
+        if (state->output_mems[j])
+          rknn_destroy_mem(state->context, state->output_mems[j]);
+      }
+      rknn_destroy(state->context);
+      delete state;
+      std::free(model_data);
+      return -1;
+    }
+  }
+
     state->input_attr.type = RKNN_TENSOR_UINT8;
     if (state->input_attr.fmt != RKNN_TENSOR_NHWC ||
       state->input_attr.w_stride <
@@ -128,6 +147,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
         static_cast<uint32_t>(std::numeric_limits<int>::max())) {
     std::fprintf(stderr,
                  "RKNN zero-copy input requires NHWC UINT8 and valid width stride\n");
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -139,6 +160,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   if (required_size > std::numeric_limits<uint32_t>::max() ||
       state->input_attr.size_with_stride < required_size) {
     std::fprintf(stderr, "RKNN input tensor stride/size is incompatible with RGA\n");
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -148,6 +171,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   int heap_fd = open("/dev/dma_heap/cma", O_RDWR | O_CLOEXEC);
   if (heap_fd < 0) {
     std::perror("open CMA DMA heap for RKNN input");
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -159,6 +184,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation) < 0) {
     std::perror("allocate RKNN input DMA-BUF");
     close(heap_fd);
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -173,6 +200,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   if (state->input_mapping == MAP_FAILED) {
     std::perror("mmap RKNN input DMA-BUF");
     close(state->input_fd);
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -190,6 +219,8 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
       rknn_destroy_mem(state->context, state->input_mem);
     munmap(state->input_mapping, state->input_mapping_size);
     close(state->input_fd);
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i)
+      rknn_destroy_mem(state->context, state->output_mems[i]);
     rknn_destroy(state->context);
     delete state;
     std::free(model_data);
@@ -240,13 +271,13 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   if (rknn_run(state->context, nullptr) < 0)
     return -1;
 
-  rknn_output outputs[3]{};
-  for (int i = 0; i < 3; ++i) {
-    outputs[i].index = i;
-    outputs[i].want_float = 0;
+  for (uint32_t i = 0; i < state->io_count.n_output; ++i) {
+    if (rknn_mem_sync(state->context, state->output_mems[i],
+                      RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) {
+      std::fprintf(stderr, "sync RKNN output tensor %u failed\n", i);
+      return -1;
+    }
   }
-  if (rknn_outputs_get(state->context, 3, outputs, nullptr) < 0)
-    return -1;
 
   std::vector<int32_t> zero_points;
   std::vector<float> scales;
@@ -257,12 +288,13 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   BOX_RECT pads{pad_left, pad_left + (model_width - resized_width) % 2,
                 pad_top, pad_top + (model_height - resized_height) % 2};
   detect_result_group_t results{};
-  int ret = post_process(static_cast<int8_t *>(outputs[0].buf),
-                         static_cast<int8_t *>(outputs[1].buf),
-                         static_cast<int8_t *>(outputs[2].buf), model_height,
+  int ret = post_process(
+                         static_cast<int8_t *>(state->output_mems[0]->virt_addr),
+                         static_cast<int8_t *>(state->output_mems[1]->virt_addr),
+                         static_cast<int8_t *>(state->output_mems[2]->virt_addr),
+                         model_height,
                          model_width, 0.25f, 0.45f, pads, scale, scale,
                          zero_points, scales, &results);
-  rknn_outputs_release(state->context, 3, outputs);
   if (ret < 0)
     return -1;
 
@@ -285,6 +317,10 @@ void rknn_detector_deinit(RknnDetector *detector) {
     return;
   DetectorState *state = static_cast<DetectorState *>(detector->context);
   if (state) {
+    for (uint32_t i = 0; i < state->io_count.n_output; ++i) {
+      if (state->output_mems[i])
+        rknn_destroy_mem(state->context, state->output_mems[i]);
+    }
     if (state->input_mem)
       rknn_destroy_mem(state->context, state->input_mem);
     if (state->input_mapping != MAP_FAILED)
