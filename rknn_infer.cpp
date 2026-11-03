@@ -29,6 +29,35 @@ struct DetectorState {
   size_t input_mapping_size;
 };
 
+int rga_draw_detection_boxes(uint32_t drm_handle, int width, int height, int pitch,
+                             const RknnDetection *detections, int count) {
+  if (drm_handle == 0 || width <= 0 || height <= 0 || pitch < width ||
+      (count > 0 && !detections))
+    return -1;
+  if (count <= 0)
+    return IM_STATUS_SUCCESS;
+
+  std::vector<im_rect> rectangles;
+  rectangles.reserve(count);
+  for (int i = 0; i < count; ++i) {
+    int left = std::max(0, std::min(width, detections[i].left)) & ~1;
+    int top = std::max(0, std::min(height, detections[i].top)) & ~1;
+    int right = std::max(0, std::min(width, detections[i].right)) & ~1;
+    int bottom = std::max(0, std::min(height, detections[i].bottom)) & ~1;
+    if (right - left < 10 || bottom - top < 10)
+      continue;
+    rectangles.push_back({left, top, right - left, bottom - top});
+  }
+  if (rectangles.empty())
+    return IM_STATUS_SUCCESS;
+
+  rga_buffer_t target = wrapbuffer_handle(
+      drm_handle, width, height, RK_FORMAT_YCbCr_420_SP, pitch, height);
+  return imrectangleArray(target, rectangles.data(),
+                          static_cast<int>(rectangles.size()), 0xff00ff00, 4,
+                          1);
+}
+
 static double monotonic_ms() {
   struct timespec timestamp;
   clock_gettime(CLOCK_MONOTONIC, &timestamp);

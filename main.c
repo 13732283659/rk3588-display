@@ -18,6 +18,7 @@
 // 💡 引入标准 DRM/KMS 头文件
 #include <time.h>
 #include <drm.h>
+#include <drm/rockchip_drm.h>
 #include <drm_fourcc.h>
 #include <drm_mode.h>
 #include <errno.h>
@@ -88,7 +89,9 @@ enum TimingStage {
   TIMING_NPU_RUN,
   TIMING_OUTPUT_SYNC,
   TIMING_POSTPROCESS,
-  TIMING_OVERLAY,
+  TIMING_RGA_BOXES,
+  TIMING_CPU_BOXES,
+  TIMING_CPU_LABELS,
   TIMING_FLIP_SUBMIT,
   TIMING_CAMERA_QUEUE,
   TIMING_STAGE_COUNT
@@ -98,8 +101,8 @@ static const char *timing_stage_names[TIMING_STAGE_COUNT] = {
     "frame",          "flip_wait",    "camera_dequeue",
     "rga_rotate",     "rknn_total",   "rga_fill",
     "rga_preprocess", "npu_run",      "output_sync",
-    "postprocess",    "overlay",      "flip_submit",
-    "camera_queue"};
+    "postprocess",    "rga_boxes",    "cpu_boxes",
+    "cpu_labels",     "flip_submit", "camera_queue"};
 
 static double monotonic_ms(void) {
   struct timespec timestamp;
@@ -295,12 +298,14 @@ int init_drm_display(struct DRMContext *ctx) {
 }
 
 // DRM 作为生产者分配 Dumb 显存并注册 FB2
+#if 0
 int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
   struct drm_mode_create_dumb create_req;
   memset(&create_req, 0, sizeof(create_req));
   create_req.width = DST_WIDTH;
   create_req.height = DST_HEIGHT * 3 / 2;
   create_req.bpp = 8;
+  // create_req.flags = ROCKCHIP_BO_DMA32; 目前不需要强制使用 32 位 DMA-BUF，除非遇到特定硬件限制
 
   if (ioctl(ctx->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req) < 0) {
     perror("❌ 错误：DRM 物理显存 Dumb 分配失败");
@@ -337,16 +342,87 @@ int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
   }
   return 0;
 }
+#endif
 
-static void draw_nv12_pixel(uint8_t *frame, int pitch, int height, int x,
-                            int y) {
-  if (x < 0 || x >= DST_WIDTH || y < 0 || y >= height)
+// 💡【核心重构】摒弃 DUMB 命令，使用瑞芯微原生私有扩展 GEM 分配器实现强制 DMA32 寻址锁区
+int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
+  uint32_t align_pitch = (DST_WIDTH + 15) & ~15;
+  size_t alloc_size = align_pitch * DST_HEIGHT * 3 / 2;
+
+  struct drm_rockchip_gem_create gc_req = {
+    .size = alloc_size,
+    .flags = ROCKCHIP_BO_DMA32 // 完美注入私有标志，物理地址铁定锁在 4G 以内
+  };
+
+  if (drmIoctl(ctx->drm_fd, DRM_IOCTL_ROCKCHIP_GEM_CREATE, &gc_req) < 0) {
+    perror("❌ 错误：调用私有 DRM_IOCTL_ROCKCHIP_GEM_CREATE 失败");
+    return -1;
+  }
+
+  ctx->gem_handle[idx] = gc_req.handle;
+  ctx->pitch[idx] = align_pitch;
+  ctx->size = alloc_size;
+
+  if (drmPrimeHandleToFD(ctx->drm_fd, gc_req.handle, DRM_CLOEXEC | DRM_RDWR, &ctx->dma_buf_fd[idx]) < 0) return -1;
+  ctx->vaddr[idx] = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->dma_buf_fd[idx], 0);
+
+  uint32_t pitches[4] = {align_pitch, align_pitch, 0, 0};
+  uint32_t offsets[4] = {0, align_pitch * DST_HEIGHT, 0, 0};
+  uint32_t handles[4] = {gc_req.handle, gc_req.handle, 0, 0};
+
+  return drmModeAddFB2(ctx->drm_fd, DST_WIDTH, DST_HEIGHT, DRM_FORMAT_NV12, handles, pitches, offsets, &ctx->fb_id[idx], 0);
+}
+
+
+
+static void draw_nv12_pixel(uint8_t *frame, int pitch, int x, int y) {
+  if (x < 0 || x >= DST_WIDTH || y < 0 || y >= DST_HEIGHT)
     return;
-  frame[y * pitch + x] = 149;
-  uint8_t *uv = frame + (size_t)pitch * height;
-  int uv_index = (y / 2) * pitch + (x & ~1);
+  frame[(size_t)y * pitch + x] = 149;
+  uint8_t *uv = frame + (size_t)pitch * DST_HEIGHT;
+  size_t uv_index = (size_t)(y / 2) * pitch + (x & ~1);
   uv[uv_index] = 43;
   uv[uv_index + 1] = 21;
+}
+
+static void draw_detection_boxes_cpu(uint8_t *frame, int pitch,
+                                     const RknnDetection *detections,
+                                     int count) {
+  for (int i = 0; i < count; ++i) {
+    int left = detections[i].left;
+    int top = detections[i].top;
+    int right = detections[i].right;
+    int bottom = detections[i].bottom;
+    if (left < 0)
+      left = 0;
+    if (top < 0)
+      top = 0;
+    if (right > DST_WIDTH)
+      right = DST_WIDTH;
+    if (bottom > DST_HEIGHT)
+      bottom = DST_HEIGHT;
+    left &= ~1;
+    top &= ~1;
+    right &= ~1;
+    bottom &= ~1;
+    if (right - left < 10 || bottom - top < 10)
+      continue;
+
+    for (int thickness = 0; thickness < 4; thickness += 2) {
+      int y_top = top + thickness;
+      int y_bottom = bottom - 2 - thickness;
+      int x_left = left + thickness;
+      int x_right = right - 2 - thickness;
+      for (int x = left; x < right; x += 2) {
+        draw_nv12_pixel(frame, pitch, x, y_top);
+        draw_nv12_pixel(frame, pitch, x, y_bottom);
+      }
+      for (int y = top; y < bottom; y += 2) {
+        draw_nv12_pixel(frame, pitch, x_left, y);
+        draw_nv12_pixel(frame, pitch, x_right, y);
+      }
+    }
+  }
 }
 
 static uint8_t score_glyph_row(char character, int row) {
@@ -445,31 +521,15 @@ static void draw_score_label(uint8_t *frame, int pitch, int left, int top,
   }
 }
 
-static void draw_detection_boxes(uint8_t *frame, int pitch,
-                                 const RknnDetection *detections, int count) {
+static void draw_detection_labels(uint8_t *frame, int pitch,
+                                  const RknnDetection *detections, int count) {
   for (int i = 0; i < count; ++i) {
     int left = detections[i].left;
-    int right = detections[i].right;
     int top = detections[i].top;
-    int bottom = detections[i].bottom;
-    if (right <= left || bottom <= top)
+    if (detections[i].right <= left || detections[i].bottom <= top)
       continue;
-    for (int thickness = 0; thickness < 3; ++thickness) {
-      int y_top = top + thickness;
-      int y_bottom = bottom - thickness;
-      int x_left = left + thickness;
-      int x_right = right - thickness;
-      for (int x = left; x <= right; ++x) {
-        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x, y_top);
-        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x, y_bottom);
-      }
-      for (int y = top; y <= bottom; ++y) {
-        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x_left, y);
-        draw_nv12_pixel(frame, pitch, DST_HEIGHT, x_right, y);
-      }
-    }
     draw_score_label(frame, pitch, left, top, detections[i].name,
-             detections[i].score);
+                     detections[i].score);
   }
 }
 
@@ -576,6 +636,7 @@ int main(int argc, char *argv[]) {
   printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ NPU -> DRM 双缓冲送显】已平稳启航...\n");
   int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
   int flip_done = 1;
+  int rga_box_drawing_enabled = 1;
   double timing_totals[TIMING_STAGE_COUNT] = {0};
   unsigned int timing_frames = 0;
   for (int i = 0; i < TOTAL_FRAMES; i++) {
@@ -710,16 +771,48 @@ int main(int argc, char *argv[]) {
     }
 
     stage_start_ms = monotonic_ms();
-    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+    if (rga_box_drawing_enabled) {
+      fprintf(stderr, "尝试使用 RGA 绘制检测框...\n");
+      int box_status = rga_draw_detection_boxes(
+          rga_dst_handle[drm_idx], DST_WIDTH, DST_HEIGHT,
+          g_drm.pitch[drm_idx], detections, detection_count);
+      fprintf(stderr, "RGA 绘制检测框状态: %d (%s)\n", box_status,
+              imStrError((IM_STATUS)box_status));
+      if (box_status != IM_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "RGA box drawing unavailable (%s, %d); switching to CPU fallback\n",
+                imStrError((IM_STATUS)box_status), box_status);
+        rga_box_drawing_enabled = 0;
+      }
+    }
+    frame_times[TIMING_RGA_BOXES] = monotonic_ms() - stage_start_ms;
+
+    stage_start_ms = monotonic_ms();
+    if (!rga_box_drawing_enabled &&
+        sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
                        DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
-      draw_detection_boxes((uint8_t *)g_drm.vaddr[drm_idx],
-                           g_drm.pitch[drm_idx], detections, detection_count);
+      draw_detection_boxes_cpu((uint8_t *)g_drm.vaddr[drm_idx],
+                               g_drm.pitch[drm_idx], detections,
+                               detection_count);
+      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    } else if (!rga_box_drawing_enabled) {
+      perror("CPU fallback DMA-BUF sync failed");
+    }
+    frame_times[TIMING_CPU_BOXES] = monotonic_ms() - stage_start_ms;
+
+    stage_start_ms = monotonic_ms();
+    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
+               DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
+      draw_detection_labels((uint8_t *)g_drm.vaddr[drm_idx],
+                g_drm.pitch[drm_idx], detections,
+                detection_count);
       sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
                      DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
     } else {
       perror("DRM DMA-BUF CPU write sync failed");
     }
-    frame_times[TIMING_OVERLAY] = monotonic_ms() - stage_start_ms;
+    frame_times[TIMING_CPU_LABELS] = monotonic_ms() - stage_start_ms;
 
     // 原子级翻页送显
     flip_done = 0;

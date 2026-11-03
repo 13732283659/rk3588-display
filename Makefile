@@ -8,6 +8,7 @@ CXX           := $(CROSS_COMPILE)g++
 # 请确保该路径下存在 usr/include/libdrm, usr/include/rga, usr/lib/librockchip_mpp.so 等
 # CROSS_COMPILE=/home/gujun/workspace/rk3588_doc/atk_dlrk3588_linux6.12/buildroot/output/alientek_rk3588/host/bin/aarch64-buildroot-linux-gnu-
 ROOT_SYSROOT  ?= /home/gujun/workspace/rk3588_doc/atk_dlrk3588_linux6.12/ubuntu/binary
+ROCKCHIP_DRM_SYSROOT ?= /home/gujun/workspace/rk3588_doc/atk_dlrk3588_linux6.12/buildroot/output/alientek_rk3588/host/aarch64-buildroot-linux-gnu/sysroot
 
 RGA_HOME_DIR ?= /home/gujun/workspace/rk3588_doc/atk_dlrk3588_linux6.12/external/linux-rga
 RKNN_ROOT     ?= /home/gujun/workspace/rknn-toolkit2/rknpu2
@@ -29,6 +30,7 @@ CXXFLAGS      := -std=c++11 -O2 -Wall -Wextra -g -fno-omit-frame-pointer
 # 注意：RK 的 rga.h 可能在 include/rga 或 include/linux/rga 下，需根据实际 sysroot 调整
 INCLUDES      := -I$(ROOT_SYSROOT)/usr/include \
                  -I$(ROOT_SYSROOT)/usr/include/libdrm \
+				 -I$(ROCKCHIP_DRM_SYSROOT)/usr/include \
 				 -I$(RGA_HOME_DIR)/build/build_linux/install/include/ \
 				 -I$(RKNN_API_DIR)/include \
 				 -I$(RKNN_DEMO_DIR)/include

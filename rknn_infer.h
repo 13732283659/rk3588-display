@@ -38,6 +38,8 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd,
                       int width, int height, int pitch,
                       RknnDetection *detections, int max_detections,
                       RknnStageTimes *stage_times);
+int rga_draw_detection_boxes(uint32_t drm_handle, int width, int height, int pitch,
+                             const RknnDetection *detections, int count);
 void rknn_detector_deinit(RknnDetector *detector);
 
 #ifdef __cplusplus
