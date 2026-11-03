@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 // 💡 引入标准 DRM/KMS 头文件
+#include <time.h>
 #include <drm.h>
 #include <drm_fourcc.h>
 #include <drm_mode.h>
@@ -75,6 +76,36 @@ struct GlobalDMABuffer {
 struct CamBuffer g_cam_bufs[CAM_BUF_COUNT];
 int g_v4l2_fd = -1;
 struct DRMContext g_drm;
+
+enum TimingStage {
+  TIMING_FRAME,
+  TIMING_FLIP_WAIT,
+  TIMING_CAMERA_DEQUEUE,
+  TIMING_RGA_ROTATE,
+  TIMING_RKNN_TOTAL,
+  TIMING_RGA_FILL,
+  TIMING_RGA_PREPROCESS,
+  TIMING_NPU_RUN,
+  TIMING_OUTPUT_SYNC,
+  TIMING_POSTPROCESS,
+  TIMING_OVERLAY,
+  TIMING_FLIP_SUBMIT,
+  TIMING_CAMERA_QUEUE,
+  TIMING_STAGE_COUNT
+};
+
+static const char *timing_stage_names[TIMING_STAGE_COUNT] = {
+    "frame",          "flip_wait",    "camera_dequeue",
+    "rga_rotate",     "rknn_total",   "rga_fill",
+    "rga_preprocess", "npu_run",      "output_sync",
+    "postprocess",    "overlay",      "flip_submit",
+    "camera_queue"};
+
+static double monotonic_ms(void) {
+  struct timespec timestamp;
+  clock_gettime(CLOCK_MONOTONIC, &timestamp);
+  return timestamp.tv_sec * 1000.0 + timestamp.tv_nsec / 1000000.0;
+}
 
 // 💡 调优规范：封装一个标准的内核 Cache 同步控制函数
 int sync_cpu_cache(int buf_fd, uint64_t sync_flags) {
@@ -545,11 +576,17 @@ int main(int argc, char *argv[]) {
   printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ NPU -> DRM 双缓冲送显】已平稳启航...\n");
   int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
   int flip_done = 1;
+  double timing_totals[TIMING_STAGE_COUNT] = {0};
+  unsigned int timing_frames = 0;
   for (int i = 0; i < TOTAL_FRAMES; i++) {
+    double frame_start_ms = monotonic_ms();
+    double stage_start_ms = frame_start_ms;
+    double frame_times[TIMING_STAGE_COUNT] = {0};
     if (!flip_done && wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0) {
       perror("等待 DRM PageFlip 完成失败");
       break;
     }
+    frame_times[TIMING_FLIP_WAIT] = monotonic_ms() - stage_start_ms;
     struct v4l2_buffer buf;
     struct v4l2_plane planes;
     memset(&buf, 0, sizeof(buf));
@@ -558,10 +595,12 @@ int main(int argc, char *argv[]) {
     buf.memory = V4L2_MEMORY_DMABUF;
     buf.length = 1;
     buf.m.planes = &planes;
+    stage_start_ms = monotonic_ms();
     if (ioctl(g_v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
       perror("DQBUF 错误");
       break;
     }
+    frame_times[TIMING_CAMERA_DEQUEUE] = monotonic_ms() - stage_start_ms;
     int active_src_fd = g_cam_bufs[buf.index].fd;
                  // ================= 🧪 注入：【4K 相机源端·逆向几何对齐】Cache 脏数据与屏幕红点实验场 =================
         // 💡 调优核心 1：在 CPU 动笔改写 4K 连续堆内存前，必须拉起内核【写开始锁】，确保硬件感知
@@ -643,7 +682,9 @@ int main(int argc, char *argv[]) {
     }
     // [BLOCK-3] 驱动 RGA 硬件执行【4K 相机 FD】到【1080P 显存
     // FD】的硬件级旋转与缩放
+    stage_start_ms = monotonic_ms();
     int ret = imrotate(rga_src_img, rga_dst_img[drm_idx], IM_HAL_TRANSFORM_ROT_90);
+    frame_times[TIMING_RGA_ROTATE] = monotonic_ms() - stage_start_ms;
     if (ret != IM_STATUS_SUCCESS) {
       printf("RGA 纯硬件像素缩放失败: %s\n", imStrError((IM_STATUS)ret));
       releasebuffer_handle(rga_src_handle);
@@ -652,14 +693,23 @@ int main(int argc, char *argv[]) {
 
     RknnDetection detections[64];
     int detection_count = 0;
+    RknnStageTimes rknn_times = {0};
+    stage_start_ms = monotonic_ms();
     detection_count = rknn_detector_run(
         &detector, g_drm.dma_buf_fd[drm_idx], DST_WIDTH, DST_HEIGHT,
-        g_drm.pitch[drm_idx], detections, 64);
+      g_drm.pitch[drm_idx], detections, 64, &rknn_times);
+    frame_times[TIMING_RKNN_TOTAL] = monotonic_ms() - stage_start_ms;
+    frame_times[TIMING_RGA_FILL] = rknn_times.rga_fill_ms;
+    frame_times[TIMING_RGA_PREPROCESS] = rknn_times.rga_preprocess_ms;
+    frame_times[TIMING_NPU_RUN] = rknn_times.npu_run_ms;
+    frame_times[TIMING_OUTPUT_SYNC] = rknn_times.output_sync_ms;
+    frame_times[TIMING_POSTPROCESS] = rknn_times.postprocess_ms;
     if (detection_count < 0) {
       fprintf(stderr, "RKNN inference failed on frame %d\n", i);
       detection_count = 0;
     }
 
+    stage_start_ms = monotonic_ms();
     if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
                        DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
       draw_detection_boxes((uint8_t *)g_drm.vaddr[drm_idx],
@@ -669,9 +719,11 @@ int main(int argc, char *argv[]) {
     } else {
       perror("DRM DMA-BUF CPU write sync failed");
     }
+    frame_times[TIMING_OVERLAY] = monotonic_ms() - stage_start_ms;
 
     // 原子级翻页送显
     flip_done = 0;
+    stage_start_ms = monotonic_ms();
     if (drmModePageFlip(g_drm.drm_fd, g_drm.crtc_id, g_drm.fb_id[drm_idx],
                         DRM_MODE_PAGE_FLIP_EVENT, &flip_done) < 0) {
       flip_done = 1;
@@ -679,10 +731,27 @@ int main(int argc, char *argv[]) {
       releasebuffer_handle(rga_src_handle);
       break;
     }
+    frame_times[TIMING_FLIP_SUBMIT] = monotonic_ms() - stage_start_ms;
     releasebuffer_handle(rga_src_handle);
+    stage_start_ms = monotonic_ms();
     if (ioctl(g_v4l2_fd, VIDIOC_QBUF, &buf) < 0) {
       perror("循环 QBUF 失败");
       break;
+    }
+    frame_times[TIMING_CAMERA_QUEUE] = monotonic_ms() - stage_start_ms;
+    frame_times[TIMING_FRAME] = monotonic_ms() - frame_start_ms;
+
+    for (int stage = 0; stage < TIMING_STAGE_COUNT; ++stage)
+      timing_totals[stage] += frame_times[stage];
+    timing_frames++;
+    if (timing_frames == 30 || i + 1 == TOTAL_FRAMES) {
+      printf("Timing avg over %u frames (ms):", timing_frames);
+      for (int stage = 0; stage < TIMING_STAGE_COUNT; ++stage)
+        printf(" %s=%.3f", timing_stage_names[stage],
+               timing_totals[stage] / timing_frames);
+      printf("\n");
+      memset(timing_totals, 0, sizeof(timing_totals));
+      timing_frames = 0;
     }
   }
   printf("流转结束，开始优雅销毁并归还系统显示主权...\n");

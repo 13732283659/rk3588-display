@@ -9,6 +9,7 @@
 #include <linux/dma-heap.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "RgaUtils.h"
@@ -27,6 +28,12 @@ struct DetectorState {
   void *input_mapping;
   size_t input_mapping_size;
 };
+
+static double monotonic_ms() {
+  struct timespec timestamp;
+  clock_gettime(CLOCK_MONOTONIC, &timestamp);
+  return timestamp.tv_sec * 1000.0 + timestamp.tv_nsec / 1000000.0;
+}
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path) {
   if (!detector || !model_path)
@@ -235,7 +242,9 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
 
 int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                       int height, int pitch, RknnDetection *detections,
-                      int max_detections) {
+                      int max_detections, RknnStageTimes *stage_times) {
+  if (stage_times)
+    std::memset(stage_times, 0, sizeof(*stage_times));
   if (!detector || !detector->context || nv12_fd < 0 || !detections ||
       max_detections <= 0 || width <= 0 || height <= 0 || pitch < width)
     return -1;
@@ -254,7 +263,10 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
       state->input_fd, model_width, model_height, RK_FORMAT_RGB_888,
       static_cast<int>(state->input_attr.w_stride), model_height);
   im_rect full_rect = {0, 0, model_width, model_height};
+  double stage_start = monotonic_ms();
   IM_STATUS rga_status = imfill(dst, full_rect, 0xff727272);
+  if (stage_times)
+    stage_times->rga_fill_ms = monotonic_ms() - stage_start;
   if (rga_status != IM_STATUS_SUCCESS) {
     std::fprintf(stderr, "RGA letterbox fill failed: %s\n",
                  imStrError(rga_status));
@@ -262,15 +274,23 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   }
   im_rect src_rect = {0, 0, width, height};
   im_rect dst_rect = {pad_left, pad_top, resized_width, resized_height};
+  stage_start = monotonic_ms();
   rga_status = improcess(src, dst, {}, src_rect, dst_rect, {}, IM_SYNC);
+  if (stage_times)
+    stage_times->rga_preprocess_ms = monotonic_ms() - stage_start;
   if (rga_status != IM_STATUS_SUCCESS) {
     std::fprintf(stderr, "RGA NV12-to-RGB letterbox resize failed: %s\n",
                  imStrError(rga_status));
     return -1;
   }
-  if (rknn_run(state->context, nullptr) < 0)
+  stage_start = monotonic_ms();
+  int run_status = rknn_run(state->context, nullptr);
+  if (stage_times)
+    stage_times->npu_run_ms = monotonic_ms() - stage_start;
+  if (run_status < 0)
     return -1;
 
+  stage_start = monotonic_ms();
   for (uint32_t i = 0; i < state->io_count.n_output; ++i) {
     if (rknn_mem_sync(state->context, state->output_mems[i],
                       RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) {
@@ -278,6 +298,8 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
       return -1;
     }
   }
+  if (stage_times)
+    stage_times->output_sync_ms = monotonic_ms() - stage_start;
 
   std::vector<int32_t> zero_points;
   std::vector<float> scales;
@@ -288,6 +310,7 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   BOX_RECT pads{pad_left, pad_left + (model_width - resized_width) % 2,
                 pad_top, pad_top + (model_height - resized_height) % 2};
   detect_result_group_t results{};
+  stage_start = monotonic_ms();
   int ret = post_process(
                          static_cast<int8_t *>(state->output_mems[0]->virt_addr),
                          static_cast<int8_t *>(state->output_mems[1]->virt_addr),
@@ -295,6 +318,8 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                          model_height,
                          model_width, 0.25f, 0.45f, pads, scale, scale,
                          zero_points, scales, &results);
+  if (stage_times)
+    stage_times->postprocess_ms = monotonic_ms() - stage_start;
   if (ret < 0)
     return -1;
 
