@@ -22,8 +22,8 @@ OBJS          := main.o rknn_infer.o rknn_postprocess.o
 
 # ================= 编译参数 =================
 # C 标准及优化等级
-CFLAGS        := -std=c11 -O2 -Wall -Wextra -g
-CXXFLAGS      := -std=c++11 -O2 -Wall -Wextra -g
+CFLAGS        := -std=c11 -O2 -Wall -Wextra -g -fno-omit-frame-pointer
+CXXFLAGS      := -std=c++11 -O2 -Wall -Wextra -g -fno-omit-frame-pointer
 
 # 头文件路径 (-I)
 # 注意：RK 的 rga.h 可能在 include/rga 或 include/linux/rga 下，需根据实际 sysroot 调整
