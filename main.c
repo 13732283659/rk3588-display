@@ -541,6 +541,7 @@ typedef struct {
   int detection_count;
   uint64_t capture_time_ns;
   uint64_t capture_interval_ns;
+  uint64_t camera_buffer_hold_ns;
   uint64_t rga_queue_ns;
   uint64_t rga_rotate_ns;
   uint64_t overlay_ns;
@@ -666,6 +667,13 @@ static int requeue_camera_buffer(int index) {
   plane.m.fd = g_cam_bufs[index].fd;
   plane.length = g_cam_bufs[index].size;
   return ioctl(g_v4l2_fd, VIDIOC_QBUF, &buf);
+}
+
+static int release_slot_camera_buffer(FrameSlot *slot) {
+  if (!slot)
+    return -1;
+  slot->camera_buffer_hold_ns = monotonic_time_ns() - slot->capture_time_ns;
+  return requeue_camera_buffer(slot->cam_index);
 }
 
 static int ring_is_empty(void) {
@@ -805,11 +813,14 @@ static void *rga_worker(void *arg) {
     releasebuffer_handle(src_handle);
     releasebuffer_handle(dst_handle);
 
+    if (release_slot_camera_buffer(slot) < 0) {
+      perror("rga_worker: RGA 完成后 QBUF 失败");
+      atomic_store(&g_worker_error, 1);
+    }
+
     if (ret != IM_STATUS_SUCCESS) {
       fprintf(stderr, "RGA rotate failed: %s\n", imStrError((IM_STATUS)ret));
       release_backbuffer(drm_idx, 0);
-      if (requeue_camera_buffer(slot->cam_index) < 0)
-        perror("rga_worker: QBUF 失败");
       release_slot(slot);
       continue;
     }
@@ -844,6 +855,7 @@ static void *display_worker(void *arg) {
   (void)arg;
   uint64_t window_start_ns = monotonic_time_ns();
   uint64_t sum_capture_interval_ns = 0;
+  uint64_t sum_camera_buffer_hold_ns = 0;
   uint64_t sum_rga_queue_ns = 0;
   uint64_t sum_rga_rotate_ns = 0;
   uint64_t sum_rga_fill_ns = 0;
@@ -886,7 +898,6 @@ static void *display_worker(void *arg) {
                         DRM_MODE_PAGE_FLIP_EVENT, &flip_done) < 0) {
       perror("display_worker: page flip 失败");
       release_backbuffer(slot->drm_index, 0);
-      requeue_camera_buffer(slot->cam_index);
       release_slot(slot);
       atomic_store(&g_worker_error, 1);
       continue;
@@ -894,7 +905,6 @@ static void *display_worker(void *arg) {
     uint64_t flip_wait_start_ns = monotonic_time_ns();
     if (wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0) {
       perror("display_worker: 等待 page flip 完成失败");
-      requeue_camera_buffer(slot->cam_index);
       release_slot(slot);
       atomic_store(&g_worker_error, 1);
       continue;
@@ -903,14 +913,10 @@ static void *display_worker(void *arg) {
     slot->end_to_end_ns = monotonic_time_ns() - slot->capture_time_ns;
     release_backbuffer(slot->drm_index, 1);
 
-    if (requeue_camera_buffer(slot->cam_index) < 0) {
-      perror("display_worker: QBUF 失败");
-      atomic_store(&g_worker_error, 1);
-    }
-
     mark_slot_stage(slot, STAGE_DISPLAYED);
     int completed = atomic_fetch_add(&g_completed_frames, 1) + 1;
     sum_capture_interval_ns += slot->capture_interval_ns;
+    sum_camera_buffer_hold_ns += slot->camera_buffer_hold_ns;
     sum_rga_queue_ns += slot->rga_queue_ns;
     sum_rga_rotate_ns += slot->rga_rotate_ns;
     sum_rga_fill_ns += slot->infer_timing.rga_fill_ns;
@@ -930,12 +936,14 @@ static void *display_worker(void *arg) {
                        ? 0.0
                        : divisor * 1000000000.0 / (double)window_elapsed_ns;
       printf("TIMING frames=%d..%d fps=%.2f avg_ms "
-             "capture_interval=%.3f rga_queue=%.3f rotate=%.3f "
+             "capture_interval=%.3f camera_buffer_hold=%.3f "
+             "rga_queue=%.3f rotate=%.3f "
              "rga_fill=%.3f rga_resize=%.3f npu_run=%.3f "
              "output_sync=%.3f postprocess=%.3f overlay=%.3f "
              "page_flip_wait=%.3f end_to_end=%.3f\n",
              completed - window_frames + 1, completed, fps,
              ns_to_ms(sum_capture_interval_ns) / divisor,
+             ns_to_ms(sum_camera_buffer_hold_ns) / divisor,
              ns_to_ms(sum_rga_queue_ns) / divisor,
              ns_to_ms(sum_rga_rotate_ns) / divisor,
              ns_to_ms(sum_rga_fill_ns) / divisor,
@@ -948,6 +956,7 @@ static void *display_worker(void *arg) {
              ns_to_ms(sum_end_to_end_ns) / divisor);
       fflush(stdout);
       sum_capture_interval_ns = 0;
+      sum_camera_buffer_hold_ns = 0;
       sum_rga_queue_ns = 0;
       sum_rga_rotate_ns = 0;
       sum_rga_fill_ns = 0;
