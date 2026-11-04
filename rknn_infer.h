@@ -26,19 +26,19 @@ typedef struct {
 } RknnDetector;
 
 typedef struct {
-  double rga_fill_ms;
-  double rga_preprocess_ms;
-  double npu_run_ms;
-  double output_sync_ms;
-  double postprocess_ms;
-} RknnStageTimes;
+  uint64_t rga_fill_ns;
+  uint64_t rga_resize_ns;
+  uint64_t npu_run_ns;
+  uint64_t output_sync_ns;
+  uint64_t postprocess_ns;
+} RknnStageTiming;
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path);
 int rknn_detector_run(RknnDetector *detector, int nv12_fd,
                       int width, int height, int pitch,
                       RknnDetection *detections, int max_detections,
-                      RknnStageTimes *stage_times);
-int rga_draw_detection_boxes(uint32_t drm_handle, int width, int height, int pitch,
+                      RknnStageTiming *timing);
+int rga_draw_detection_boxes(int dma_buf_fd, int width, int height, int pitch,
                              const RknnDetection *detections, int count);
 void rknn_detector_deinit(RknnDetector *detector);
 

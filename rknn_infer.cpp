@@ -7,9 +7,9 @@
 #include <fcntl.h>
 #include <limits>
 #include <linux/dma-heap.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "RgaUtils.h"
@@ -29,9 +29,15 @@ struct DetectorState {
   size_t input_mapping_size;
 };
 
-int rga_draw_detection_boxes(uint32_t drm_handle, int width, int height, int pitch,
+static uint64_t monotonic_time_ns() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+}
+
+int rga_draw_detection_boxes(int dma_buf_fd, int width, int height, int pitch,
                              const RknnDetection *detections, int count) {
-  if (drm_handle == 0 || width <= 0 || height <= 0 || pitch < width ||
+  if (dma_buf_fd < 0 || width <= 0 || height <= 0 || pitch < width ||
       (count > 0 && !detections))
     return -1;
   if (count <= 0)
@@ -51,17 +57,20 @@ int rga_draw_detection_boxes(uint32_t drm_handle, int width, int height, int pit
   if (rectangles.empty())
     return IM_STATUS_SUCCESS;
 
-  rga_buffer_t target = wrapbuffer_handle(
-      drm_handle, width, height, RK_FORMAT_YCbCr_420_SP, pitch, height);
-  return imrectangleArray(target, rectangles.data(),
-                          static_cast<int>(rectangles.size()), 0xff00ff00, 4,
-                          1);
-}
+  im_handle_param_t target_param = {
+      static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+      RK_FORMAT_YCbCr_420_SP};
+  rga_buffer_handle_t target_handle = importbuffer_fd(dma_buf_fd, &target_param);
+  if (target_handle == 0)
+    return -1;
 
-static double monotonic_ms() {
-  struct timespec timestamp;
-  clock_gettime(CLOCK_MONOTONIC, &timestamp);
-  return timestamp.tv_sec * 1000.0 + timestamp.tv_nsec / 1000000.0;
+  rga_buffer_t target = wrapbuffer_handle(
+      target_handle, width, height, RK_FORMAT_YCbCr_420_SP, pitch, height);
+  int ret = imrectangleArray(target, rectangles.data(),
+                             static_cast<int>(rectangles.size()),
+                             0xff00ff00, 4, 1);
+  releasebuffer_handle(target_handle);
+  return ret;
 }
 
 int rknn_detector_init(RknnDetector *detector, const char *model_path) {
@@ -271,9 +280,9 @@ int rknn_detector_init(RknnDetector *detector, const char *model_path) {
 
 int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                       int height, int pitch, RknnDetection *detections,
-                      int max_detections, RknnStageTimes *stage_times) {
-  if (stage_times)
-    std::memset(stage_times, 0, sizeof(*stage_times));
+                      int max_detections, RknnStageTiming *timing) {
+  if (timing)
+    std::memset(timing, 0, sizeof(*timing));
   if (!detector || !detector->context || nv12_fd < 0 || !detections ||
       max_detections <= 0 || width <= 0 || height <= 0 || pitch < width)
     return -1;
@@ -292,10 +301,10 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
       state->input_fd, model_width, model_height, RK_FORMAT_RGB_888,
       static_cast<int>(state->input_attr.w_stride), model_height);
   im_rect full_rect = {0, 0, model_width, model_height};
-  double stage_start = monotonic_ms();
+  uint64_t stage_start_ns = monotonic_time_ns();
   IM_STATUS rga_status = imfill(dst, full_rect, 0xff727272);
-  if (stage_times)
-    stage_times->rga_fill_ms = monotonic_ms() - stage_start;
+  if (timing)
+    timing->rga_fill_ns = monotonic_time_ns() - stage_start_ns;
   if (rga_status != IM_STATUS_SUCCESS) {
     std::fprintf(stderr, "RGA letterbox fill failed: %s\n",
                  imStrError(rga_status));
@@ -303,23 +312,23 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   }
   im_rect src_rect = {0, 0, width, height};
   im_rect dst_rect = {pad_left, pad_top, resized_width, resized_height};
-  stage_start = monotonic_ms();
+  stage_start_ns = monotonic_time_ns();
   rga_status = improcess(src, dst, {}, src_rect, dst_rect, {}, IM_SYNC);
-  if (stage_times)
-    stage_times->rga_preprocess_ms = monotonic_ms() - stage_start;
+  if (timing)
+    timing->rga_resize_ns = monotonic_time_ns() - stage_start_ns;
   if (rga_status != IM_STATUS_SUCCESS) {
     std::fprintf(stderr, "RGA NV12-to-RGB letterbox resize failed: %s\n",
                  imStrError(rga_status));
     return -1;
   }
-  stage_start = monotonic_ms();
+  stage_start_ns = monotonic_time_ns();
   int run_status = rknn_run(state->context, nullptr);
-  if (stage_times)
-    stage_times->npu_run_ms = monotonic_ms() - stage_start;
+  if (timing)
+    timing->npu_run_ns = monotonic_time_ns() - stage_start_ns;
   if (run_status < 0)
     return -1;
 
-  stage_start = monotonic_ms();
+  stage_start_ns = monotonic_time_ns();
   for (uint32_t i = 0; i < state->io_count.n_output; ++i) {
     if (rknn_mem_sync(state->context, state->output_mems[i],
                       RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) {
@@ -327,8 +336,8 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
       return -1;
     }
   }
-  if (stage_times)
-    stage_times->output_sync_ms = monotonic_ms() - stage_start;
+  if (timing)
+    timing->output_sync_ns = monotonic_time_ns() - stage_start_ns;
 
   std::vector<int32_t> zero_points;
   std::vector<float> scales;
@@ -339,7 +348,7 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
   BOX_RECT pads{pad_left, pad_left + (model_width - resized_width) % 2,
                 pad_top, pad_top + (model_height - resized_height) % 2};
   detect_result_group_t results{};
-  stage_start = monotonic_ms();
+  stage_start_ns = monotonic_time_ns();
   int ret = post_process(
                          static_cast<int8_t *>(state->output_mems[0]->virt_addr),
                          static_cast<int8_t *>(state->output_mems[1]->virt_addr),
@@ -347,10 +356,11 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                          model_height,
                          model_width, 0.25f, 0.45f, pads, scale, scale,
                          zero_points, scales, &results);
-  if (stage_times)
-    stage_times->postprocess_ms = monotonic_ms() - stage_start;
-  if (ret < 0)
+  if (ret < 0) {
+    if (timing)
+      timing->postprocess_ns = monotonic_time_ns() - stage_start_ns;
     return -1;
+  }
 
   int count = std::min(results.count, max_detections);
   for (int i = 0; i < count; ++i) {
@@ -363,6 +373,8 @@ int rknn_detector_run(RknnDetector *detector, int nv12_fd, int width,
                  sizeof(detections[i].name) - 1);
     detections[i].name[sizeof(detections[i].name) - 1] = '\0';
   }
+  if (timing)
+    timing->postprocess_ns = monotonic_time_ns() - stage_start_ns;
   return count;
 }
 

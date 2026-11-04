@@ -8,15 +8,17 @@
 #include <linux/dma-heap.h> // 用于统一的物理连续内存分配
 #include <linux/videodev2.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 // 💡 引入标准 DRM/KMS 头文件
-#include <time.h>
 #include <drm.h>
 #include <drm/rockchip_drm.h>
 #include <drm_fourcc.h>
@@ -46,6 +48,8 @@
 
 // V4L2 采集端缓冲区数量
 #define CAM_BUF_COUNT 2
+#define DRM_BUF_COUNT 3
+#define TIMING_REPORT_INTERVAL 100
 
 struct CamBuffer {
   int fd;      // 导出的 Camera DMA-BUF 文件描述符
@@ -60,12 +64,12 @@ struct DRMContext {
   drmModeModeInfo mode;
 
   // 双缓冲显存管理
-  uint32_t fb_id[2];
-  int gem_handle[2];
-  int dma_buf_fd[2]; // 供 RGA 写入的显存 FD
-  void *vaddr[2];    // 存放映射后的虚拟地址，供 CPU 访问
+  uint32_t fb_id[DRM_BUF_COUNT];
+  int gem_handle[DRM_BUF_COUNT];
+  int dma_buf_fd[DRM_BUF_COUNT]; // 供 RGA 写入的显存 FD
+  void *vaddr[DRM_BUF_COUNT];    // 存放映射后的虚拟地址，供 CPU 访问
   int size;
-  uint32_t pitch[2];
+  uint32_t pitch[DRM_BUF_COUNT];
 };
 
 struct GlobalDMABuffer {
@@ -78,37 +82,13 @@ struct CamBuffer g_cam_bufs[CAM_BUF_COUNT];
 int g_v4l2_fd = -1;
 struct DRMContext g_drm;
 
-enum TimingStage {
-  TIMING_FRAME,
-  TIMING_FLIP_WAIT,
-  TIMING_CAMERA_DEQUEUE,
-  TIMING_RGA_ROTATE,
-  TIMING_RKNN_TOTAL,
-  TIMING_RGA_FILL,
-  TIMING_RGA_PREPROCESS,
-  TIMING_NPU_RUN,
-  TIMING_OUTPUT_SYNC,
-  TIMING_POSTPROCESS,
-  TIMING_RGA_BOXES,
-  TIMING_CPU_BOXES,
-  TIMING_CPU_LABELS,
-  TIMING_FLIP_SUBMIT,
-  TIMING_CAMERA_QUEUE,
-  TIMING_STAGE_COUNT
-};
-
-static const char *timing_stage_names[TIMING_STAGE_COUNT] = {
-    "frame",          "flip_wait",    "camera_dequeue",
-    "rga_rotate",     "rknn_total",   "rga_fill",
-    "rga_preprocess", "npu_run",      "output_sync",
-    "postprocess",    "rga_boxes",    "cpu_boxes",
-    "cpu_labels",     "flip_submit", "camera_queue"};
-
-static double monotonic_ms(void) {
-  struct timespec timestamp;
-  clock_gettime(CLOCK_MONOTONIC, &timestamp);
-  return timestamp.tv_sec * 1000.0 + timestamp.tv_nsec / 1000000.0;
+static uint64_t monotonic_time_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+
+static double ns_to_ms(uint64_t ns) { return (double)ns / 1000000.0; }
 
 // 💡 调优规范：封装一个标准的内核 Cache 同步控制函数
 int sync_cpu_cache(int buf_fd, uint64_t sync_flags) {
@@ -365,6 +345,11 @@ int create_drm_framebuffer(struct DRMContext *ctx, int idx) {
 
   if (drmPrimeHandleToFD(ctx->drm_fd, gc_req.handle, DRM_CLOEXEC | DRM_RDWR, &ctx->dma_buf_fd[idx]) < 0) return -1;
   ctx->vaddr[idx] = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->dma_buf_fd[idx], 0);
+  if (ctx->vaddr[idx] == MAP_FAILED) {
+    perror("映射 DRM framebuffer 失败");
+    close(ctx->dma_buf_fd[idx]);
+    return -1;
+  }
 
   uint32_t pitches[4] = {align_pitch, align_pitch, 0, 0};
   uint32_t offsets[4] = {0, align_pitch * DST_HEIGHT, 0, 0};
@@ -533,6 +518,454 @@ static void draw_detection_labels(uint8_t *frame, int pitch,
   }
 }
 
+#define FRAME_RING_SIZE 3
+
+typedef enum {
+  STAGE_FREE = 0,
+  STAGE_CAPTURED,
+  STAGE_RGA_BUSY,
+  STAGE_ROTATED,
+  STAGE_INFER_BUSY,
+  STAGE_INFERRED,
+  STAGE_DISPLAY_BUSY,
+  STAGE_DISPLAYED
+} FrameStage;
+
+typedef struct {
+  int valid;
+  int frame_id;
+  int cam_index;
+  int cam_fd;
+  int drm_index;
+  int display_fd;
+  int detection_count;
+  uint64_t capture_time_ns;
+  uint64_t capture_interval_ns;
+  uint64_t rga_queue_ns;
+  uint64_t rga_rotate_ns;
+  uint64_t overlay_ns;
+  uint64_t page_flip_wait_ns;
+  uint64_t end_to_end_ns;
+  RknnStageTiming infer_timing;
+  FrameStage stage;
+  RknnDetection detections[64];
+} FrameSlot;
+
+static FrameSlot g_frame_ring[FRAME_RING_SIZE];
+static pthread_mutex_t g_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ring_cond = PTHREAD_COND_INITIALIZER;
+static atomic_int g_stop;
+static atomic_int g_capture_stop;
+static atomic_int g_worker_error;
+static atomic_int g_completed_frames;
+static int g_front_drm_index;
+static int g_drm_reserved[DRM_BUF_COUNT];
+
+static void init_ring_slots(void) {
+  pthread_mutex_lock(&g_ring_lock);
+  for (int i = 0; i < FRAME_RING_SIZE; ++i) {
+    memset(&g_frame_ring[i], 0, sizeof(g_frame_ring[i]));
+    g_frame_ring[i].valid = 0;
+    g_frame_ring[i].frame_id = i;
+    g_frame_ring[i].stage = STAGE_FREE;
+  }
+  pthread_mutex_unlock(&g_ring_lock);
+}
+
+static FrameSlot *store_captured_frame(int cam_index, uint64_t capture_time_ns,
+                                       uint64_t capture_interval_ns) {
+  pthread_mutex_lock(&g_ring_lock);
+  for (int i = 0; i < FRAME_RING_SIZE; ++i) {
+    if (!g_frame_ring[i].valid) {
+      memset(&g_frame_ring[i], 0, sizeof(g_frame_ring[i]));
+      g_frame_ring[i].valid = 1;
+      g_frame_ring[i].frame_id = i;
+      g_frame_ring[i].cam_index = cam_index;
+      g_frame_ring[i].cam_fd = g_cam_bufs[cam_index].fd;
+      g_frame_ring[i].capture_time_ns = capture_time_ns;
+      g_frame_ring[i].capture_interval_ns = capture_interval_ns;
+      g_frame_ring[i].stage = STAGE_CAPTURED;
+      pthread_cond_broadcast(&g_ring_cond);
+      pthread_mutex_unlock(&g_ring_lock);
+      return &g_frame_ring[i];
+    }
+  }
+  pthread_mutex_unlock(&g_ring_lock);
+  return NULL;
+}
+
+static FrameSlot *claim_slot(FrameStage ready_stage, FrameStage busy_stage) {
+  pthread_mutex_lock(&g_ring_lock);
+  for (;;) {
+    for (int i = 0; i < FRAME_RING_SIZE; ++i) {
+      if (g_frame_ring[i].valid && g_frame_ring[i].stage == ready_stage) {
+        g_frame_ring[i].stage = busy_stage;
+        pthread_mutex_unlock(&g_ring_lock);
+        return &g_frame_ring[i];
+      }
+    }
+    if (atomic_load(&g_stop))
+      break;
+    pthread_cond_wait(&g_ring_cond, &g_ring_lock);
+  }
+  pthread_mutex_unlock(&g_ring_lock);
+  return NULL;
+}
+
+static void mark_slot_stage(FrameSlot *slot, FrameStage stage) {
+  if (!slot)
+    return;
+  pthread_mutex_lock(&g_ring_lock);
+  slot->stage = stage;
+  pthread_cond_broadcast(&g_ring_cond);
+  pthread_mutex_unlock(&g_ring_lock);
+}
+
+static int acquire_backbuffer(void) {
+  pthread_mutex_lock(&g_ring_lock);
+  for (;;) {
+    for (int i = 0; i < DRM_BUF_COUNT; ++i) {
+      if (i != g_front_drm_index && !g_drm_reserved[i]) {
+        g_drm_reserved[i] = 1;
+        pthread_mutex_unlock(&g_ring_lock);
+        return i;
+      }
+    }
+    if (atomic_load(&g_stop))
+      break;
+    pthread_cond_wait(&g_ring_cond, &g_ring_lock);
+  }
+  pthread_mutex_unlock(&g_ring_lock);
+  return -1;
+}
+
+static void release_backbuffer(int index, int became_front) {
+  if (index < 0 || index >= DRM_BUF_COUNT)
+    return;
+  pthread_mutex_lock(&g_ring_lock);
+  if (became_front)
+    g_front_drm_index = index;
+  g_drm_reserved[index] = 0;
+  pthread_cond_broadcast(&g_ring_cond);
+  pthread_mutex_unlock(&g_ring_lock);
+}
+
+static int requeue_camera_buffer(int index) {
+  if (index < 0 || index >= CAM_BUF_COUNT)
+    return -1;
+
+  struct v4l2_buffer buf;
+  struct v4l2_plane plane;
+  memset(&buf, 0, sizeof(buf));
+  memset(&plane, 0, sizeof(plane));
+  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  buf.memory = V4L2_MEMORY_DMABUF;
+  buf.index = index;
+  buf.length = 1;
+  buf.m.planes = &plane;
+  plane.m.fd = g_cam_bufs[index].fd;
+  plane.length = g_cam_bufs[index].size;
+  return ioctl(g_v4l2_fd, VIDIOC_QBUF, &buf);
+}
+
+static int ring_is_empty(void) {
+  int empty = 1;
+  pthread_mutex_lock(&g_ring_lock);
+  for (int i = 0; i < FRAME_RING_SIZE; ++i) {
+    if (g_frame_ring[i].valid) {
+      empty = 0;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_ring_lock);
+  return empty;
+}
+
+static void release_slot(FrameSlot *slot) {
+  if (!slot)
+    return;
+  pthread_mutex_lock(&g_ring_lock);
+  memset(slot, 0, sizeof(*slot));
+  slot->valid = 0;
+  slot->stage = STAGE_FREE;
+  pthread_cond_broadcast(&g_ring_cond);
+  pthread_mutex_unlock(&g_ring_lock);
+}
+
+static void *capture_worker(void *arg) {
+  (void)arg;
+  uint64_t previous_capture_time_ns = 0;
+  while (!atomic_load(&g_capture_stop)) {
+    struct pollfd pfd = {.fd = g_v4l2_fd, .events = POLLIN};
+    int poll_ret = poll(&pfd, 1, 100);
+    if (atomic_load(&g_capture_stop))
+      break;
+    if (poll_ret < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("capture_worker: poll 错误");
+      atomic_store(&g_worker_error, 1);
+      break;
+    }
+    if (poll_ret == 0)
+      continue;
+
+    struct v4l2_buffer buf;
+    struct v4l2_plane planes;
+    memset(&buf, 0, sizeof(buf));
+    memset(&planes, 0, sizeof(planes));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.memory = V4L2_MEMORY_DMABUF;
+    buf.length = 1;
+    buf.m.planes = &planes;
+
+    if (ioctl(g_v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
+      if (atomic_load(&g_capture_stop))
+        break;
+      perror("capture_worker: DQBUF 错误");
+      atomic_store(&g_worker_error, 1);
+      break;
+    }
+
+    if (buf.index >= CAM_BUF_COUNT) {
+      fprintf(stderr, "capture_worker: invalid V4L2 buffer index %u\n", buf.index);
+      atomic_store(&g_worker_error, 1);
+      break;
+    }
+
+    uint64_t capture_time_ns = monotonic_time_ns();
+    uint64_t capture_interval_ns = previous_capture_time_ns == 0
+                       ? 0
+                       : capture_time_ns - previous_capture_time_ns;
+    previous_capture_time_ns = capture_time_ns;
+    FrameSlot *slot = store_captured_frame((int)buf.index, capture_time_ns,
+                         capture_interval_ns);
+    if (!slot) {
+      fprintf(stderr, "capture_worker: no free slot\n");
+      if (requeue_camera_buffer((int)buf.index) < 0)
+        perror("capture_worker: QBUF 失败");
+      continue;
+    }
+  }
+  return NULL;
+}
+
+static void *rga_worker(void *arg) {
+  (void)arg;
+  while (!atomic_load(&g_stop)) {
+    FrameSlot *slot = claim_slot(STAGE_CAPTURED, STAGE_RGA_BUSY);
+    if (!slot)
+      break;
+
+    int drm_idx = acquire_backbuffer();
+    if (drm_idx < 0) {
+      if (requeue_camera_buffer(slot->cam_index) < 0)
+        perror("rga_worker: QBUF 失败");
+      release_slot(slot);
+      continue;
+    }
+    slot->drm_index = drm_idx;
+    slot->rga_queue_ns = monotonic_time_ns() - slot->capture_time_ns;
+
+    im_handle_param_t src_param = {SRC_WIDTH, SRC_HEIGHT, RK_FORMAT_YCbCr_420_SP};
+    im_handle_param_t dst_param = {DST_WIDTH, DST_HEIGHT, RK_FORMAT_YCbCr_420_SP};
+
+    rga_buffer_handle_t src_handle = importbuffer_fd(slot->cam_fd, &src_param);
+    if (src_handle == 0) {
+      fprintf(stderr, "RGA failed to import camera buffer\n");
+      release_backbuffer(drm_idx, 0);
+      requeue_camera_buffer(slot->cam_index);
+      release_slot(slot);
+      continue;
+    }
+    rga_buffer_t src = wrapbuffer_handle(src_handle, SRC_WIDTH, SRC_HEIGHT,
+                                         RK_FORMAT_YCbCr_420_SP);
+    src.wstride = (SRC_WIDTH + 15) & ~15;
+    src.hstride = (SRC_HEIGHT + 1) & ~1;
+
+    rga_buffer_handle_t dst_handle = importbuffer_fd(g_drm.dma_buf_fd[drm_idx], &dst_param);
+    if (dst_handle == 0) {
+      fprintf(stderr, "RGA failed to import DRM buffer\n");
+      releasebuffer_handle(src_handle);
+      release_backbuffer(drm_idx, 0);
+      requeue_camera_buffer(slot->cam_index);
+      release_slot(slot);
+      continue;
+    }
+    rga_buffer_t dst = wrapbuffer_handle(dst_handle, DST_WIDTH, DST_HEIGHT,
+                                         RK_FORMAT_YCbCr_420_SP);
+    dst.wstride = g_drm.pitch[drm_idx];
+    dst.hstride = DST_HEIGHT;
+
+    uint64_t rotate_start_ns = monotonic_time_ns();
+    int ret = imrotate(src, dst, IM_HAL_TRANSFORM_ROT_90);
+    slot->rga_rotate_ns = monotonic_time_ns() - rotate_start_ns;
+    releasebuffer_handle(src_handle);
+    releasebuffer_handle(dst_handle);
+
+    if (ret != IM_STATUS_SUCCESS) {
+      fprintf(stderr, "RGA rotate failed: %s\n", imStrError((IM_STATUS)ret));
+      release_backbuffer(drm_idx, 0);
+      if (requeue_camera_buffer(slot->cam_index) < 0)
+        perror("rga_worker: QBUF 失败");
+      release_slot(slot);
+      continue;
+    }
+
+    slot->display_fd = g_drm.dma_buf_fd[drm_idx];
+    mark_slot_stage(slot, STAGE_ROTATED);
+  }
+  return NULL;
+}
+
+static void *infer_worker(void *arg) {
+  RknnDetector *detector = (RknnDetector *)arg;
+  while (!atomic_load(&g_stop)) {
+    FrameSlot *slot = claim_slot(STAGE_ROTATED, STAGE_INFER_BUSY);
+    if (!slot)
+      break;
+
+    slot->detection_count = rknn_detector_run(
+        detector, slot->display_fd, DST_WIDTH, DST_HEIGHT,
+        g_drm.pitch[slot->drm_index], slot->detections, 64,
+        &slot->infer_timing);
+    if (slot->detection_count < 0) {
+      fprintf(stderr, "RKNN inference failed on rotated frame\n");
+      slot->detection_count = 0;
+    }
+    mark_slot_stage(slot, STAGE_INFERRED);
+  }
+  return NULL;
+}
+
+static void *display_worker(void *arg) {
+  (void)arg;
+  uint64_t window_start_ns = monotonic_time_ns();
+  uint64_t sum_capture_interval_ns = 0;
+  uint64_t sum_rga_queue_ns = 0;
+  uint64_t sum_rga_rotate_ns = 0;
+  uint64_t sum_rga_fill_ns = 0;
+  uint64_t sum_rga_resize_ns = 0;
+  uint64_t sum_npu_run_ns = 0;
+  uint64_t sum_output_sync_ns = 0;
+  uint64_t sum_postprocess_ns = 0;
+  uint64_t sum_overlay_ns = 0;
+  uint64_t sum_page_flip_wait_ns = 0;
+  uint64_t sum_end_to_end_ns = 0;
+  int window_frames = 0;
+
+  while (!atomic_load(&g_stop)) {
+    FrameSlot *slot = claim_slot(STAGE_INFERRED, STAGE_DISPLAY_BUSY);
+    if (!slot)
+      break;
+
+    uint64_t overlay_start_ns = monotonic_time_ns();
+    int box_status = rga_draw_detection_boxes(
+        g_drm.dma_buf_fd[slot->drm_index], DST_WIDTH, DST_HEIGHT,
+        g_drm.pitch[slot->drm_index], slot->detections, slot->detection_count);
+    if (box_status != IM_STATUS_SUCCESS) {
+      fprintf(stderr, "RGA box draw failed: %s\n",
+              imStrError((IM_STATUS)box_status));
+    }
+
+    if (sync_cpu_cache(g_drm.dma_buf_fd[slot->drm_index],
+                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
+      draw_detection_labels((uint8_t *)g_drm.vaddr[slot->drm_index],
+                            g_drm.pitch[slot->drm_index],
+                            slot->detections, slot->detection_count);
+      sync_cpu_cache(g_drm.dma_buf_fd[slot->drm_index],
+                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    }
+    slot->overlay_ns = monotonic_time_ns() - overlay_start_ns;
+
+    int flip_done = 0;
+    if (drmModePageFlip(g_drm.drm_fd, g_drm.crtc_id,
+                        g_drm.fb_id[slot->drm_index],
+                        DRM_MODE_PAGE_FLIP_EVENT, &flip_done) < 0) {
+      perror("display_worker: page flip 失败");
+      release_backbuffer(slot->drm_index, 0);
+      requeue_camera_buffer(slot->cam_index);
+      release_slot(slot);
+      atomic_store(&g_worker_error, 1);
+      continue;
+    }
+    uint64_t flip_wait_start_ns = monotonic_time_ns();
+    if (wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0) {
+      perror("display_worker: 等待 page flip 完成失败");
+      requeue_camera_buffer(slot->cam_index);
+      release_slot(slot);
+      atomic_store(&g_worker_error, 1);
+      continue;
+    }
+    slot->page_flip_wait_ns = monotonic_time_ns() - flip_wait_start_ns;
+    slot->end_to_end_ns = monotonic_time_ns() - slot->capture_time_ns;
+    release_backbuffer(slot->drm_index, 1);
+
+    if (requeue_camera_buffer(slot->cam_index) < 0) {
+      perror("display_worker: QBUF 失败");
+      atomic_store(&g_worker_error, 1);
+    }
+
+    mark_slot_stage(slot, STAGE_DISPLAYED);
+    int completed = atomic_fetch_add(&g_completed_frames, 1) + 1;
+    sum_capture_interval_ns += slot->capture_interval_ns;
+    sum_rga_queue_ns += slot->rga_queue_ns;
+    sum_rga_rotate_ns += slot->rga_rotate_ns;
+    sum_rga_fill_ns += slot->infer_timing.rga_fill_ns;
+    sum_rga_resize_ns += slot->infer_timing.rga_resize_ns;
+    sum_npu_run_ns += slot->infer_timing.npu_run_ns;
+    sum_output_sync_ns += slot->infer_timing.output_sync_ns;
+    sum_postprocess_ns += slot->infer_timing.postprocess_ns;
+    sum_overlay_ns += slot->overlay_ns;
+    sum_page_flip_wait_ns += slot->page_flip_wait_ns;
+    sum_end_to_end_ns += slot->end_to_end_ns;
+    window_frames++;
+
+    if (window_frames >= TIMING_REPORT_INTERVAL) {
+      uint64_t window_elapsed_ns = monotonic_time_ns() - window_start_ns;
+      double divisor = (double)window_frames;
+      double fps = window_elapsed_ns == 0
+                       ? 0.0
+                       : divisor * 1000000000.0 / (double)window_elapsed_ns;
+      printf("TIMING frames=%d..%d fps=%.2f avg_ms "
+             "capture_interval=%.3f rga_queue=%.3f rotate=%.3f "
+             "rga_fill=%.3f rga_resize=%.3f npu_run=%.3f "
+             "output_sync=%.3f postprocess=%.3f overlay=%.3f "
+             "page_flip_wait=%.3f end_to_end=%.3f\n",
+             completed - window_frames + 1, completed, fps,
+             ns_to_ms(sum_capture_interval_ns) / divisor,
+             ns_to_ms(sum_rga_queue_ns) / divisor,
+             ns_to_ms(sum_rga_rotate_ns) / divisor,
+             ns_to_ms(sum_rga_fill_ns) / divisor,
+             ns_to_ms(sum_rga_resize_ns) / divisor,
+             ns_to_ms(sum_npu_run_ns) / divisor,
+             ns_to_ms(sum_output_sync_ns) / divisor,
+             ns_to_ms(sum_postprocess_ns) / divisor,
+             ns_to_ms(sum_overlay_ns) / divisor,
+             ns_to_ms(sum_page_flip_wait_ns) / divisor,
+             ns_to_ms(sum_end_to_end_ns) / divisor);
+      fflush(stdout);
+      sum_capture_interval_ns = 0;
+      sum_rga_queue_ns = 0;
+      sum_rga_rotate_ns = 0;
+      sum_rga_fill_ns = 0;
+      sum_rga_resize_ns = 0;
+      sum_npu_run_ns = 0;
+      sum_output_sync_ns = 0;
+      sum_postprocess_ns = 0;
+      sum_overlay_ns = 0;
+      sum_page_flip_wait_ns = 0;
+      sum_end_to_end_ns = 0;
+      window_frames = 0;
+      window_start_ns = monotonic_time_ns();
+    }
+    release_slot(slot);
+  }
+  return NULL;
+}
+
 int main(int argc, char *argv[]) {
   const char *model_path = argc > 1 ? argv[1] : DEFAULT_RKNN_MODEL;
   RknnDetector detector = {0};
@@ -543,21 +976,12 @@ int main(int argc, char *argv[]) {
   printf("RKNN detector ready: %s, input=%dx%d\n", model_path,
          detector.model_width, detector.model_height);
 
-  #if 0    // 调试实验开关：0=关闭，1=开启    
-  FILE *fp = fopen(OUTPUT_FILE, "ab");
-  if (fp == NULL) {
-    perror("fopen failed");
-    rknn_detector_deinit(&detector);
-    return -1;
-  }
-  #endif    
-
-  // 1. 点亮 DRM 显示架构并初始化双缓冲显存
   if (init_drm_display(&g_drm) < 0)
     return -1;
-  if (create_drm_framebuffer(&g_drm, 0) < 0 ||
-      create_drm_framebuffer(&g_drm, 1) < 0)
-    return -1;
+  for (int i = 0; i < DRM_BUF_COUNT; ++i) {
+    if (create_drm_framebuffer(&g_drm, i) < 0)
+      return -1;
+  }
 
   if (drmModeSetCrtc(g_drm.drm_fd, g_drm.crtc_id, g_drm.fb_id[0], 0, 0,
                      &g_drm.conn_id, 1, &g_drm.mode) < 0) {
@@ -565,308 +989,72 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  // [STEP-1] 大管家最先登场，在外部物理划分输入端的 DMA-BUF
-  size_t src_size = SRC_WIDTH * SRC_HEIGHT * 3 / 2; // 4K NV12
+  size_t src_size = SRC_WIDTH * SRC_HEIGHT * 3 / 2;
   if (allocate_from_central_heap(src_size, &g_cam_bufs[0]) < 0 ||
       allocate_from_central_heap(src_size, &g_cam_bufs[1]) < 0) {
     printf("全局中央统一 DMA-BUF 缓冲区池分配失败!\n");
     return -1;
   }
 
-  // [STEP-2] 初始化 Camera 消费者身份
   if (init_v4l2() < 0)
     return -1;
 
-  // [STEP-3] 规范 Stride 参数对齐
-  int src_wstride = (SRC_WIDTH + 15) & ~15;
-  int src_hstride = (SRC_HEIGHT + 1) & ~1;
-  int dst_hstride = DST_HEIGHT;
+  init_ring_slots();
+  g_front_drm_index = 0;
+  printf("⚡【线程化·Camera ➡ RGA ➡ NPU -> DRM 双三缓冲流水线】已启动...\n");
 
-  // [STEP-4] 统一将两端的固定外部 fd 提前导入并持久化包装进 RGA 管理体系中
-  im_handle_param_t src_param = {SRC_WIDTH, SRC_HEIGHT, RK_FORMAT_YCbCr_420_SP};
-  im_handle_param_t dst_param = {DST_WIDTH, DST_HEIGHT, RK_FORMAT_YCbCr_420_SP};
+  pthread_t capture_tid, rga_tid, infer_tid, display_tid;
+  pthread_create(&capture_tid, NULL, capture_worker, NULL);
+  pthread_create(&rga_tid, NULL, rga_worker, NULL);
+  pthread_create(&infer_tid, NULL, infer_worker, &detector);
+  pthread_create(&display_tid, NULL, display_worker, NULL);
 
-  rga_buffer_handle_t rga_dst_handle[2];
-  rga_buffer_t rga_dst_img[2];
-  for (int i = 0; i < 2; i++) {
-    rga_dst_handle[i] = importbuffer_fd(g_drm.dma_buf_fd[i], &dst_param);
-    if (rga_dst_handle[i] == 0) {
-      printf("❌ 致命错误：RGA 导入 DRM 显存 FD 失败！\n");
-      return -1;
-    }
+  while (atomic_load(&g_completed_frames) < TOTAL_FRAMES &&
+         !atomic_load(&g_worker_error))
+    usleep(10000);
 
-    rga_dst_img[i] = wrapbuffer_handle(rga_dst_handle[i], DST_WIDTH, DST_HEIGHT,
-                                       RK_FORMAT_YCbCr_420_SP);
-    rga_dst_img[i].wstride = g_drm.pitch[i];
-    rga_dst_img[i].hstride = dst_hstride;
+  atomic_store(&g_capture_stop, 1);
+  pthread_join(capture_tid, NULL);
+  if (!atomic_load(&g_worker_error)) {
+    while (!ring_is_empty())
+      usleep(1000);
+  } else {
+    atomic_store(&g_stop, 1);
+    pthread_mutex_lock(&g_ring_lock);
+    pthread_cond_broadcast(&g_ring_cond);
+    pthread_mutex_unlock(&g_ring_lock);
   }
-  // =========================================================================
-  // 💡 核心调优：在进入循环前（视频流还未启动时），一次性在 2
-  // 个显存中央提前抹红 彻底解耦多硬件异步时间差，完美对齐 Stride
-  // 寻址，解决前几十帧红点丢失的隐患
-  // =========================================================================
 
-  #if 0 // 调试实验开关：0=关闭，1=开启
-  for (int idx = 0; idx < 2; idx++) {
-    uint8_t *static_vaddr = (uint8_t *)g_drm.vaddr[idx];
-    uint32_t static_stride = g_drm.pitch[idx];
-    uint8_t *static_uv = static_vaddr + (static_stride * DST_HEIGHT);
-    int red_dot_count = 0;
-    int target_y = DST_HEIGHT / 2; // 选在竖屏的正中间行
-    int start_x = DST_WIDTH / 4;   // 从屏幕水平 1/4 处开始排布
-    for (int x_offset = 0; x_offset < 500; x_offset += 100) {
-      if (red_dot_count < 5) {
-        int cx = start_x + x_offset;
-        int cy = target_y;
-        // 强制将红点 YUV 数值写入物理显存的有效显示区
-        static_vaddr[cy * static_stride + cx] = 0x4C;                  // Y=76
-        static_uv[(cy / 2) * static_stride + (cx / 2) * 2] = 0x54;     // U=84
-        static_uv[(cy / 2) * static_stride + (cx / 2) * 2 + 1] = 0xFF; // V=255
-        red_dot_count++;
-      }
-    }
-    // 冲刷初始 Cache，确保静态数据完全同步到 DDR
-    sync_cpu_cache(g_drm.dma_buf_fd[idx],
-                   DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-    sync_cpu_cache(g_drm.dma_buf_fd[idx],
-                   DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-  }
-  #endif
-
-  printf("⚡【全链路零拷贝·Camera ➡ RGA ➡ NPU -> DRM 双缓冲送显】已平稳启航...\n");
-  int drm_idx = 0; // 双缓冲显示交替索引（0 和 1）
-  int flip_done = 1;
-  int rga_box_drawing_enabled = 1;
-  double timing_totals[TIMING_STAGE_COUNT] = {0};
-  unsigned int timing_frames = 0;
-  for (int i = 0; i < TOTAL_FRAMES; i++) {
-    double frame_start_ms = monotonic_ms();
-    double stage_start_ms = frame_start_ms;
-    double frame_times[TIMING_STAGE_COUNT] = {0};
-    if (!flip_done && wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0) {
-      perror("等待 DRM PageFlip 完成失败");
-      break;
-    }
-    frame_times[TIMING_FLIP_WAIT] = monotonic_ms() - stage_start_ms;
-    struct v4l2_buffer buf;
-    struct v4l2_plane planes;
-    memset(&buf, 0, sizeof(buf));
-    memset(&planes, 0, sizeof(planes));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    buf.memory = V4L2_MEMORY_DMABUF;
-    buf.length = 1;
-    buf.m.planes = &planes;
-    stage_start_ms = monotonic_ms();
-    if (ioctl(g_v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
-      perror("DQBUF 错误");
-      break;
-    }
-    frame_times[TIMING_CAMERA_DEQUEUE] = monotonic_ms() - stage_start_ms;
-    int active_src_fd = g_cam_bufs[buf.index].fd;
-                 // ================= 🧪 注入：【4K 相机源端·逆向几何对齐】Cache 脏数据与屏幕红点实验场 =================
-        // 💡 调优核心 1：在 CPU 动笔改写 4K 连续堆内存前，必须拉起内核【写开始锁】，确保硬件感知
-       
-        #if 0 //调优实验开关：0=关闭，1=开启
-        //这个是刷新缓存的操作，确保CPU对内存的修改能够被其他硬件看到
-        sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-
-        uint8_t *cam_vaddr = (uint8_t *)g_cam_bufs[buf.index].vaddr;
-        size_t cam_bytes = g_cam_bufs[buf.index].size; 
-        
-        // 定位符合 4K 相机内核拓扑的 UV 平面起始地址 (Y 占满了 src_wstride * src_hstride)
-        uint8_t *cam_uv_plane = cam_vaddr + (src_wstride * src_hstride);
-        
-        // ⚡ 强行污染 CPU Cache 缓存行 (保持空读，强行把这块内存挂在 Cache 上)
-        volatile uint8_t dummy_read = 0;
-        for (size_t p = 0; p < cam_bytes; p += 64) {
-            dummy_read = cam_vaddr[p]; 
-        }
-
-        // ⚡ 精准逆向二阶阵列涂写：在 4K（3840x2160）原始底图的【顶部中央区域】画 5 个纯红点！
-        // 💡 深度推导：只有将红点配置在 4K 的顶部（如第 200 行），经过 RGA 旋转 90 度后，才会变成竖屏的左右正中行！
-        int red_dot_count = 0;
-        int cam_target_y = SRC_HEIGHT / 4;  // 设在 4K 图像的顶部 1/4 处 (第 540 行左右)
-        int cam_start_x  = SRC_WIDTH / 2;   // 设在 4K 图像的水平正中央 (第 1920 列左右)
-
-        for (int y = 200; y < SRC_HEIGHT - 200; y += 40) {
-            for (int x = 200; x < SRC_WIDTH - 200; x++) {
-                
-                // 💡 调优核心：只要满足网格节拍，就无条件强制染色，封杀一切缩放裁剪死区！
-                if ((y % 40 == 0) || (x % 40 == 0)) {
-                    // 写入 4K 源端 Y 平面
-                    cam_vaddr[y * src_wstride + x] = 0x4C; // Y=76
-                    
-                    // 写入 4K 源端 UV 平面
-                    int uv_x = (x / 2) * 2;
-                    int uv_y = y / 2;
-                    size_t uv_offset = (uv_y * src_wstride) + uv_x;
-                    
-                    cam_uv_plane[uv_offset]     = 0x54; // U=84
-                    cam_uv_plane[uv_offset + 1] = 0xFF; // V=255
-                }
-            }
-        }
-
-        // 💡 调优核心 2：CPU 涂写红点结束，必须立刻拉起内核【写结束锁】！！！
-        // ⚡ 内核收到该指令后，会强制让八核 ARM 打开缓存闸门，将憋在 Cache 里的 5 个红点像素
-        // 瞬间同步、冲刷（Flush）进物理 DDR 内存条中。如果注释掉这行，屏幕上红点绝对会闪烁或消失。
-        sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-
-        // --------------------------------------------------------------------------------
-        // 💡 读锁包裹：把这帧被 CPU 抹了红点的 4K 原始数据直接落盘抓包
-        //sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-      
-        if (fp) {
-            size_t written = fwrite(cam_vaddr, 1, cam_bytes, fp);
-        }
-        #endif
-        //sync_cpu_cache(active_src_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-        // ==============================================================
-        // ==============================================================
-    // 翻转指针，定位隐藏的后台显存
-    drm_idx = !drm_idx;
-    rga_buffer_handle_t rga_src_handle =
-        importbuffer_fd(active_src_fd, &src_param);
-    rga_buffer_t rga_src_img = wrapbuffer_handle(
-        rga_src_handle, SRC_WIDTH, SRC_HEIGHT, RK_FORMAT_YCbCr_420_SP);
-    rga_src_img.wstride = src_wstride;
-    rga_src_img.hstride = src_hstride;
-    // 💡 调试打印：首帧通过 imcheck 验证格式
-    if (i == 0) {
-      IM_STATUS aligned_status = imcheck(rga_src_img, rga_dst_img[drm_idx],
-                                         (im_rect){0}, (im_rect){0});
-      printf("Aligned buffers: src wstride=%d hstride=%d, dst wstride=%d "
-             "hstride=%d, imcheck=%d (%s)\n",
-             rga_src_img.wstride, rga_src_img.hstride,
-             rga_dst_img[drm_idx].wstride, rga_dst_img[drm_idx].hstride,
-             aligned_status, imStrError(aligned_status));
-    }
-    // [BLOCK-3] 驱动 RGA 硬件执行【4K 相机 FD】到【1080P 显存
-    // FD】的硬件级旋转与缩放
-    stage_start_ms = monotonic_ms();
-    int ret = imrotate(rga_src_img, rga_dst_img[drm_idx], IM_HAL_TRANSFORM_ROT_90);
-    frame_times[TIMING_RGA_ROTATE] = monotonic_ms() - stage_start_ms;
-    if (ret != IM_STATUS_SUCCESS) {
-      printf("RGA 纯硬件像素缩放失败: %s\n", imStrError((IM_STATUS)ret));
-      releasebuffer_handle(rga_src_handle);
-      break;
-    }
-
-    RknnDetection detections[64];
-    int detection_count = 0;
-    RknnStageTimes rknn_times = {0};
-    stage_start_ms = monotonic_ms();
-    detection_count = rknn_detector_run(
-        &detector, g_drm.dma_buf_fd[drm_idx], DST_WIDTH, DST_HEIGHT,
-      g_drm.pitch[drm_idx], detections, 64, &rknn_times);
-    frame_times[TIMING_RKNN_TOTAL] = monotonic_ms() - stage_start_ms;
-    frame_times[TIMING_RGA_FILL] = rknn_times.rga_fill_ms;
-    frame_times[TIMING_RGA_PREPROCESS] = rknn_times.rga_preprocess_ms;
-    frame_times[TIMING_NPU_RUN] = rknn_times.npu_run_ms;
-    frame_times[TIMING_OUTPUT_SYNC] = rknn_times.output_sync_ms;
-    frame_times[TIMING_POSTPROCESS] = rknn_times.postprocess_ms;
-    if (detection_count < 0) {
-      fprintf(stderr, "RKNN inference failed on frame %d\n", i);
-      detection_count = 0;
-    }
-
-    stage_start_ms = monotonic_ms();
-    if (rga_box_drawing_enabled) {
-      fprintf(stderr, "尝试使用 RGA 绘制检测框...\n");
-      int box_status = rga_draw_detection_boxes(
-          rga_dst_handle[drm_idx], DST_WIDTH, DST_HEIGHT,
-          g_drm.pitch[drm_idx], detections, detection_count);
-      fprintf(stderr, "RGA 绘制检测框状态: %d (%s)\n", box_status,
-              imStrError((IM_STATUS)box_status));
-      if (box_status != IM_STATUS_SUCCESS) {
-        fprintf(stderr,
-                "RGA box drawing unavailable (%s, %d); switching to CPU fallback\n",
-                imStrError((IM_STATUS)box_status), box_status);
-        rga_box_drawing_enabled = 0;
-      }
-    }
-    frame_times[TIMING_RGA_BOXES] = monotonic_ms() - stage_start_ms;
-
-    stage_start_ms = monotonic_ms();
-    if (!rga_box_drawing_enabled &&
-        sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-                       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
-      draw_detection_boxes_cpu((uint8_t *)g_drm.vaddr[drm_idx],
-                               g_drm.pitch[drm_idx], detections,
-                               detection_count);
-      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-    } else if (!rga_box_drawing_enabled) {
-      perror("CPU fallback DMA-BUF sync failed");
-    }
-    frame_times[TIMING_CPU_BOXES] = monotonic_ms() - stage_start_ms;
-
-    stage_start_ms = monotonic_ms();
-    if (sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-               DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
-      draw_detection_labels((uint8_t *)g_drm.vaddr[drm_idx],
-                g_drm.pitch[drm_idx], detections,
-                detection_count);
-      sync_cpu_cache(g_drm.dma_buf_fd[drm_idx],
-                     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-    } else {
-      perror("DRM DMA-BUF CPU write sync failed");
-    }
-    frame_times[TIMING_CPU_LABELS] = monotonic_ms() - stage_start_ms;
-
-    // 原子级翻页送显
-    flip_done = 0;
-    stage_start_ms = monotonic_ms();
-    if (drmModePageFlip(g_drm.drm_fd, g_drm.crtc_id, g_drm.fb_id[drm_idx],
-                        DRM_MODE_PAGE_FLIP_EVENT, &flip_done) < 0) {
-      flip_done = 1;
-      perror("显卡 PageFlip 翻页失败");
-      releasebuffer_handle(rga_src_handle);
-      break;
-    }
-    frame_times[TIMING_FLIP_SUBMIT] = monotonic_ms() - stage_start_ms;
-    releasebuffer_handle(rga_src_handle);
-    stage_start_ms = monotonic_ms();
-    if (ioctl(g_v4l2_fd, VIDIOC_QBUF, &buf) < 0) {
-      perror("循环 QBUF 失败");
-      break;
-    }
-    frame_times[TIMING_CAMERA_QUEUE] = monotonic_ms() - stage_start_ms;
-    frame_times[TIMING_FRAME] = monotonic_ms() - frame_start_ms;
-
-    for (int stage = 0; stage < TIMING_STAGE_COUNT; ++stage)
-      timing_totals[stage] += frame_times[stage];
-    timing_frames++;
-    if (timing_frames == 30 || i + 1 == TOTAL_FRAMES) {
-      printf("Timing avg over %u frames (ms):", timing_frames);
-      for (int stage = 0; stage < TIMING_STAGE_COUNT; ++stage)
-        printf(" %s=%.3f", timing_stage_names[stage],
-               timing_totals[stage] / timing_frames);
-      printf("\n");
-      memset(timing_totals, 0, sizeof(timing_totals));
-      timing_frames = 0;
-    }
-  }
-  printf("流转结束，开始优雅销毁并归还系统显示主权...\n");
-  if (!flip_done && wait_for_page_flip(g_drm.drm_fd, &flip_done) < 0)
-    perror("退出前等待 DRM PageFlip 完成失败");
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  atomic_store(&g_stop, 1);
+  pthread_mutex_lock(&g_ring_lock);
+  pthread_cond_broadcast(&g_ring_cond);
+  pthread_mutex_unlock(&g_ring_lock);
+
+  pthread_join(rga_tid, NULL);
+  pthread_join(infer_tid, NULL);
+  pthread_join(display_tid, NULL);
   ioctl(g_v4l2_fd, VIDIOC_STREAMOFF, &type);
-  if (rga_dst_handle[0])
-    releasebuffer_handle(rga_dst_handle[0]);
-  if (rga_dst_handle[1])
-    releasebuffer_handle(rga_dst_handle[1]);
-  for (int i = 0; i < 2; i++) {
+
+  printf("流转结束，开始优雅销毁并归还系统显示主权...\n");
+  for (int i = 0; i < DRM_BUF_COUNT; i++) {
+    drmModeRmFB(g_drm.drm_fd, g_drm.fb_id[i]);
+    if (g_drm.vaddr[i] && g_drm.vaddr[i] != MAP_FAILED)
+      munmap(g_drm.vaddr[i], g_drm.size);
     close(g_drm.dma_buf_fd[i]);
-    struct drm_mode_destroy_dumb destroy_req = {.handle = g_drm.gem_handle[i]};
-    ioctl(g_drm.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_req);
+    struct drm_gem_close close_req = {.handle = (uint32_t)g_drm.gem_handle[i]};
+    drmIoctl(g_drm.drm_fd, DRM_IOCTL_GEM_CLOSE, &close_req);
   }
-  for (int i = 0; i < CAM_BUF_COUNT; i++)
+  for (int i = 0; i < CAM_BUF_COUNT; i++) {
+    if (g_cam_bufs[i].vaddr && g_cam_bufs[i].vaddr != MAP_FAILED)
+      munmap(g_cam_bufs[i].vaddr, g_cam_bufs[i].size);
     close(g_cam_bufs[i].fd);
+  }
   close(g_v4l2_fd);
   drmClose(g_drm.drm_fd);
-  // fclose(fp);
+  pthread_cond_destroy(&g_ring_cond);
+  pthread_mutex_destroy(&g_ring_lock);
   rknn_detector_deinit(&detector);
   printf("全链路资源清理完毕，程序安全退出。\n");
-  return 0;
+  return atomic_load(&g_worker_error) ? -1 : 0;
 }
